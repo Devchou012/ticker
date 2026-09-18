@@ -111,6 +111,42 @@ def fetch_taifex(prefix):
         quotes[prefix] = (price, float(near["CRefPrice"]))
 
 
+TWSE_MIS = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch="
+
+
+def fetch_twse(syms):
+    """台股即時：證交所 MIS 約 5 秒一筆，蓋掉 Yahoo 延遲約 20 分鐘的價格、昨收、高低、成交量。
+    量比用的 10 日均量仍沿用 Yahoo（歷史值，延遲無妨）。"""
+    chans = {}
+    for sym in syms:
+        if sym == "^TWII":
+            chans["tse_t00"] = sym
+        elif sym.endswith(".TW"):
+            chans[f"tse_{sym[:-3]}"] = sym
+        elif sym.endswith(".TWO"):
+            chans[f"otc_{sym[:-4]}"] = sym
+    ctx = ssl.create_default_context()
+    ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT  # 同期交所：憑證缺 3.13 嚴格模式要的欄位
+    keys = list(chans)
+    for i in range(0, len(keys), 50):  # 一次查 50 檔
+        url = TWSE_MIS + "|".join(f"{k}.tw" for k in keys[i:i + 50])  # 代號大小寫要照原樣（00631L）
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        for r in json.load(urllib.request.urlopen(req, timeout=10, context=ctx)).get("msgArray", []):
+            sym = chans.get(f"{r.get('ex')}_{r.get('c')}")
+            if not sym:
+                continue
+            try:
+                # z 是最近成交價；快照剛好落在兩筆成交之間時是 "-"，改用最佳買價
+                price = float(r["z"]) if r.get("z", "-") != "-" else float(r["b"].split("_")[0])
+                prev = float(r["y"])
+            except (KeyError, ValueError, AttributeError):
+                continue
+            old = quotes.get(sym, ())
+            avg = old[3] if len(old) > 3 else None
+            vol = float(r["v"]) * 1000 if r.get("v") else None  # MIS 成交量單位是張
+            quotes[sym] = (price, prev, vol, avg, float(r["l"]), float(r["h"]))
+
+
 # 央行利率不是盤中報價：美國抓 FRED 的聯邦基金目標區間上限，日本、台灣抓 Trading Economics
 # 漲跌欄是跟上一次利率決議比。一小時抓一次就夠。
 RATE_SEC = 3600
@@ -207,7 +243,12 @@ def poller():
                     fetch_intraday()
                 except Exception:
                     pass  # 分時抓不到不影響即時報價
-            list(pool.map(fetch, [s for rows in [INDICES, *PAGES.values()] for s, _ in rows]))
+            syms = [s for rows in [INDICES, *PAGES.values()] for s, _ in rows]
+            list(pool.map(fetch, syms))
+            try:
+                fetch_twse(syms)
+            except Exception:
+                pass  # 證交所連不上就先用 Yahoo 的延遲價
             last_update = time.time()
             time.sleep(REFRESH_SEC if market_hours() else IDLE_SEC)
 
