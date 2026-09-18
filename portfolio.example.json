@@ -1,0 +1,10 @@
+{
+  "庫存": [
+    {"symbol": "2330.TW", "name": "台積電", "shares": 1000, "cost": 1850.0},
+    {"symbol": "NVDA", "name": "NVIDIA", "shares": 10, "cost": 120.5}
+  ],
+  "觀察": [
+    {"symbol": "2881.TW", "name": "富邦金"},
+    {"symbol": "2542.TW", "name": "興富發"}
+  ]
+}
