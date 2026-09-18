@@ -46,7 +46,7 @@ BASE_PAGES = {
              ("SNDK", "SanDisk"), ("MU", "Micron"), ("SPCX", "SpaceX"), ("INTC", "Intel"), ("AMD", "AMD"),
              ("MRVL", "Marvell"), ("PLTR", "Palantir"),
              ("GOOGL", "Google"), ("AMZN", "Amazon"), ("AMAT", "應用材料"), ("ASML", "ASML"), ("COHR", "Coherent"),
-             ("MRNA", "Moderna"), ("SOXX", "SOXX 半導體ETF"),
+             ("MRNA", "Moderna"), ("SOXX", "半導體ETF"),
              ("000660.KS", "SK海力士")],  # 海力士沒有美國掛牌，放韓股報價（韓元、韓股時段）
     "日韓": [("7203.T", "Toyota"),
              ("8035.T", "東京威力"), ("285A.T", "鎧俠"), ("8031.T", "三井物產"), ("8058.T", "三菱商事"),
