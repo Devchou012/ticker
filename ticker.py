@@ -145,6 +145,26 @@ def fetch_twse(syms):
             avg = old[3] if len(old) > 3 else None
             vol = float(r["v"]) * 1000 if r.get("v") else None  # MIS 成交量單位是張
             quotes[sym] = (price, prev, vol, avg, float(r["l"]), float(r["h"]))
+            mark_live(sym, price)
+
+
+def mark_live(sym, price):
+    """盤中把證交所即時價記到現在這個時段格，走勢圖最右邊就不會落後。"""
+    start, length = SESSIONS.get(suffix_of(sym), (None, None))
+    now = time.localtime()
+    mins = now.tm_hour * 60 + now.tm_min - (start or 0)
+    if start is None or now.tm_wday >= 5 or not 0 <= mins < length:
+        return
+    cell = min(int(mins / length * RANGE_W * 2), RANGE_W * 2 - 1)
+    today = time.strftime("%Y%m%d")
+    day, marks = live.get(sym, (today, {}))
+    if day != today:
+        marks = {}
+    marks[cell] = price
+    live[sym] = (today, marks)
+    cells = intraday.get(sym)
+    if cells and all(c is None for c in cells[cell + 1:]):  # 只接在已有資料的後面，不改 Yahoo 那段
+        cells[cell] = price
 
 
 # 央行利率不是盤中報價：美國抓 FRED 的聯邦基金目標區間上限，日本、台灣抓 Trading Economics
@@ -187,6 +207,9 @@ def fetch(sym):
         except Exception:
             pass
         return
+    q = quotes.get(sym, ())
+    if (sym == "^TWII" or sym.endswith((".TW", ".TWO"))) and len(q) > 3 and q[3]:
+        return  # 台股即時價由 fetch_twse 更新；Yahoo 只需抓一次 10 日均量，省下請求免得被限流
     try:
         fi = yf.Ticker(sym).fast_info
         quotes[sym] = (fi["lastPrice"], fi["previousClose"], fi["lastVolume"], fi["tenDayAverageVolume"],
@@ -259,6 +282,7 @@ SPARK_SWAP_SEC = 5   # 區間條 / 分時走勢輪流切換的秒數
 INTRADAY_SEC = 60    # 分時資料重抓間隔
 intraday = {}        # symbol -> 收盤價（交易時段切成 RANGE_W*2 個時間點，未到的是 None）
 intraday_at = 0.0
+live = {}            # symbol -> (日期, {時段格: 證交所即時價})，補 Yahoo 延遲的那一段
 
 
 def fetch_intraday():
@@ -278,6 +302,13 @@ def fetch_intraday():
             for stamp, value in close.items():
                 mins = (stamp - open_at).total_seconds() / 60
                 cells[min(int(mins / length * RANGE_W * 2), RANGE_W * 2 - 1)] = float(value)
+            # Yahoo 台股晚約 20 分鐘：最後幾格改用面板自己記下的證交所即時價接上
+            day, marks = live.get(sym, (None, {}))
+            if day == time.strftime("%Y%m%d"):
+                last = max((i for i, c in enumerate(cells) if c is not None), default=-1)
+                for i, price in marks.items():
+                    if i > last:
+                        cells[i] = price
             intraday[sym] = cells
         except (KeyError, TypeError, ValueError):
             pass  # 抓不到就沒有走勢圖，其他欄照常
