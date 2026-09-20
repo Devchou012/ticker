@@ -572,15 +572,16 @@ screen = []  # 上一幀每一行的純文字，給 clicked_market 反查頁籤�
 
 
 def draw(console, renderable):
-    """游標回左上角，整頁剛好畫滿窗格高度，最後一行不換行，所以畫面不會捲動。
+    """游標回左上角，整頁畫滿窗格（底部留一行），最後一行不換行，所以畫面不會捲動。
     不用 rich Live：alt screen 從 hook／重開窗格時偶爾整片空白；原地模式滿高時每次重畫都會往下捲。"""
     width, height = console.size
+    height -= 1  # 底部留一行：每行都剛好滿寬，寫進右下角那一格終端機就捲一行（畫面上下抖動）
     buf = Console(file=io.StringIO(), width=width, height=height, force_terminal=True,
                   color_system="truecolor", legacy_windows=False, no_color=False)
     buf.print(renderable, crop=True)
     lines = buf.file.getvalue().split("\n")[:height]
     screen[:] = [ANSI.sub("", line) for line in lines]
-    # \x1b[?2026h/l：同步更新，終端機等整幀寫完才換上，不會畫一半就顯示（閃爍）
+    # \x1b[?2026h/l：同步更新，終端機等整幀寫完才換上，不會畫一半就顯示（撕裂）
     console.file.write("\x1b[?2026h\x1b[H"
                        + "\r\n".join(line + "\x1b[0m\x1b[K" for line in lines)
                        + "\x1b[J\x1b[?2026l")
@@ -618,7 +619,8 @@ def main():
             mtime = reload_if_changed(mtime)
             if Path(__file__).stat().st_mtime != code_at:
                 sys.exit(3)  # 程式碼改了：外層會用新版重跑，同一個窗格
-            names = views_for(console.height, console.width)  # 每圈重算，拖拉窗格高度會自動重新分頁
+            # -1：draw() 底部留一行。每圈重算，拖拉窗格高度會自動重新分頁
+            names = views_for(console.height - 1, console.width)
             idx %= len(names)
             key, pending = pending or read_key(), None
             new = (idx + 1) % len(names) if time.time() - shown >= AUTO_SEC else idx
