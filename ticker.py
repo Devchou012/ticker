@@ -14,6 +14,26 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+
+def ascii_ca_bundle():
+    """libcurl 開不了路徑含中文字的憑證檔（curl: (77)），yfinance 走的 curl_cffi 就整批抓不到，
+    面板只剩 TWSE 那條路有數字。複製一份到純 ASCII 路徑再用。要在 import yfinance 之前跑。"""
+    import certifi
+    import shutil
+    src = certifi.where()
+    if src.isascii():
+        return
+    dst = Path("C:/Users/Public/ticker-cacert.pem")
+    if not str(dst).isascii():
+        return
+    if not dst.exists() or dst.stat().st_mtime < Path(src).stat().st_mtime:
+        shutil.copyfile(src, dst)
+    os.environ["CURL_CA_BUNDLE"] = os.environ["SSL_CERT_FILE"] = str(dst)
+    certifi.where = lambda: str(dst)  # yfinance 直接把 where() 當 verify= 傳進去，環境變數擋不住
+
+
+ascii_ca_bundle()
+
 import yfinance as yf
 from rich import box
 from rich.console import Console, Group
@@ -588,11 +608,22 @@ def draw(console, renderable):
     console.file.flush()
 
 
+def log_stderr():
+    """yfinance 一輪輪詢往 stderr 印幾百行（SSL、delisted…）。那些字落進窗格，
+    每印一行畫面就捲一行，看起來就是面板一直上下抖。整個 fd 2 導進 log，
+    不管哪個函式庫在印都擋得住，要查錯就看這個檔。"""
+    path = Path(__file__).with_name("ticker-errors.log")
+    f = open(path, "a", buffering=1, encoding="utf-8", errors="replace")
+    os.dup2(f.fileno(), 2)
+    sys.stderr = f
+
+
 def main():
     # 從 Claude Code hook 啟動時環境帶著固定的 COLUMNS/LINES，rich 會照它畫、不看窗格真實大小
     os.environ.pop("COLUMNS", None)
     os.environ.pop("LINES", None)
     if "--once" not in sys.argv:
+        log_stderr()
         lock = socket.socket()
         try:  # 佔一個本機 port 當單一實例鎖，程式結束（含被砍）自動釋放
             lock.bind(("127.0.0.1", 47653))
