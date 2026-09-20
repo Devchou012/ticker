@@ -580,7 +580,10 @@ def draw(console, renderable):
     buf.print(renderable, crop=True)
     lines = buf.file.getvalue().split("\n")[:height]
     screen[:] = [ANSI.sub("", line) for line in lines]
-    console.file.write("\x1b[H" + "\r\n".join(line + "\x1b[0m\x1b[K" for line in lines) + "\x1b[J")
+    # \x1b[?2026h/l：同步更新，終端機等整幀寫完才換上，不會畫一半就顯示（閃爍）
+    console.file.write("\x1b[?2026h\x1b[H"
+                       + "\r\n".join(line + "\x1b[0m\x1b[K" for line in lines)
+                       + "\x1b[J\x1b[?2026l")
     console.file.flush()
 
 
