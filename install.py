@@ -18,7 +18,9 @@ def step(msg):
 
 
 # 1. Python packages
-subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "--user", "rich", "yfinance"])
+# --user is rejected inside a virtualenv; there it already installs into the venv
+user_flag = [] if sys.prefix != sys.base_prefix else ["--user"]
+subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", *user_flag, "rich", "yfinance"])
 step("rich, yfinance installed")
 
 # 2. Personal list: start from the example; portfolio.json is not in git
@@ -46,8 +48,9 @@ else:
     step(f"SessionStart hook added (backup: {settings.name}.bak-ticker)")
 
 # 4. PowerShell command `cs` (alias 股票介面) that opens a new window: panel on top, Claude Code below
+# powershell writes the path in the console codepage, not UTF-8 (CJK home dirs break text=True)
 profile = Path(subprocess.check_output(
-    ["powershell", "-NoProfile", "-Command", "$PROFILE"], text=True).strip())
+    ["powershell", "-NoProfile", "-Command", "$PROFILE"]).decode("mbcs").strip())
 text = profile.read_text(encoding="utf-8-sig") if profile.exists() else ""
 if "function cs" in text:
     step("PowerShell cs command already present")
