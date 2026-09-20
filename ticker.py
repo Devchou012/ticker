@@ -1,4 +1,4 @@
-"""終端機行情面板：頂部大盤固定，下方個股每 AUTO_SEC 秒自動翻頁；←/→ 或數字鍵手動切頁，q 離開。資料源 Yahoo Finance（免費，部分市場有延遲）。"""
+"""終端機行情面板：頂部大盤固定，下方個股每 AUTO_SEC 秒自動翻頁；←/→ 或數字鍵手動切頁，空白鍵暫停翻頁，q 離開。資料源 Yahoo Finance（免費，部分市場有延遲）。"""
 import io
 import re
 import json
@@ -119,6 +119,7 @@ INDEX_SWAP_SEC = 4        # 大盤第二行在幅度 / 漲跌點數之間輪流�
 
 quotes = {}  # symbol -> (price, prev_close)
 last_update = 0.0
+paused = False  # 空白鍵暫停自動翻頁，想盯著某一頁看的時候用
 
 
 def fetch_taifex(prefix):
@@ -276,6 +277,18 @@ def volume_ratio(sym, vol, avg):
     return f"{ratio:.1f}x", style
 
 
+def session_open(sym):
+    """這檔的市場現在有沒有在交易。判斷不了的（總經、匯率、期貨、加密）一律當有，照抓。"""
+    suffix = suffix_of(sym)
+    if suffix not in SESSIONS:
+        return True
+    start, length = SESSIONS[suffix]
+    now = time.localtime()
+    since = (now.tm_hour * 60 + now.tm_min - start) % 1440
+    opened = time.localtime(time.time() - since * 60)  # 美股跨午夜，要看開盤那天是不是平日
+    return since < length and opened.tm_wday < 5
+
+
 def market_hours():
     """台灣時間平日 08:00-14:30（台日韓港陸）或 21:00-05:00（美股）算盤中。"""
     # ponytail: 固定時段不管夏令時間跟假日，要精準再查各交易所行事曆
@@ -296,6 +309,9 @@ def poller():
                 except Exception:
                     pass  # 分時抓不到不影響即時報價
             syms = [s for rows in [INDICES, *PAGES.values()] for s, _ in rows]
+            # 收盤的市場價格不會再動，跳過可以少掉夜裡大半的請求，免得被 Yahoo 限流。
+            # 還沒抓到過的照抓，不然剛開面板時收盤市場會整片空白
+            syms = [s for s in syms if s in FUTURES or s in RATES or session_open(s) or s not in quotes]
             list(pool.map(fetch, syms))
             try:
                 fetch_twse(syms)
@@ -448,7 +464,7 @@ def render(view, old_rows=None, t=1.0):
     tables = [stock_table(hold, show_spark, new_rows, old_rows, t, range(c, min(c + per_col, n)))
               for c in range(0, n, per_col)] or [stock_table(hold, show_spark, [], None, t, range(0))]
     grid = Table.grid(expand=True, padding=(0, 2))
-    grid.title = f"{tabs}{TAB_GAP}[{SYMBOL}]· {age}s[/]"
+    grid.title = f"{tabs}{TAB_GAP}[{SYMBOL}]· {age}s{' ⏸' if paused else ''}[/]"
     for _ in tables:
         grid.add_column(ratio=1)
     grid.add_row(*tables)
@@ -618,12 +634,14 @@ def log_stderr():
     每印一行畫面就捲一行，看起來就是面板一直上下抖。整個 fd 2 導進 log，
     不管哪個函式庫在印都擋得住，要查錯就看這個檔。"""
     path = Path(__file__).with_name("ticker-errors.log")
-    f = open(path, "a", buffering=1, encoding="utf-8", errors="replace")
+    mode = "w" if path.exists() and path.stat().st_size > 1_000_000 else "a"  # 太大就從頭寫，不然會無限長
+    f = open(path, mode, buffering=1, encoding="utf-8", errors="replace")
     os.dup2(f.fileno(), 2)
     sys.stderr = f
 
 
 def main():
+    global paused
     # 從 Claude Code hook 啟動時環境帶著固定的 COLUMNS/LINES，rich 會照它畫、不看窗格真實大小
     os.environ.pop("COLUMNS", None)
     os.environ.pop("LINES", None)
@@ -659,10 +677,13 @@ def main():
             names = views_for(console.height - 1, console.width)
             idx %= len(names)
             key, pending = pending or read_key(), None
-            new = (idx + 1) % len(names) if time.time() - shown >= AUTO_SEC else idx
+            new = (idx + 1) % len(names) if not paused and time.time() - shown >= AUTO_SEC else idx
             if key == "q":
                 return
-            if isinstance(key, tuple) and (market := clicked_market(*key[1:])):
+            if key == " ":  # 空白鍵定住這一頁，標題出現 ⏸；再按一次恢復自動翻頁
+                paused = not paused
+                shown = time.time()
+            elif isinstance(key, tuple) and (market := clicked_market(*key[1:])):
                 own = [i for i, v in enumerate(names) if v[0] == market]
                 new = own[(own.index(idx) + 1) % len(own)] if idx in own else own[0]  # 再點同一個頁籤就翻它的下一子頁
             elif key == "right":
