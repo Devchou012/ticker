@@ -160,14 +160,16 @@ FLAT, NAME, SYMBOL, HEADER, TAB = "#b0b0b0", "bold #ffffff", "#8a8a8a", "bold #4
 RULE = "#3a3a3a"  # 表頭下方細線顏色
 RULE_BAR = "#4a4a4a"  # 今日區間條的線
 VOL_HOT_STYLE, VOL_LOW_STYLE = "bold #000000 on #ffd54f", "#555555"  # 爆量用反白黃底，跟紅綠、翻牌字都分得開
+TICK_UP, TICK_DOWN = "bold #000000 on #ff3b3b", "bold #000000 on #00e676"  # 價格跳動時整格亮一下，顏色跟漲跌一致
+TICK_SEC = 0.8  # 亮燈持續秒數；主迴圈 20fps 重繪，這段時間內都看得到
 FLIPPING = "bold #ffd54f"  # 翻牌中的字用琥珀色，像機場看板
 # 翻牌：列延遲 ROW_DELAY、字延遲 CHAR_DELAY、字輪每格 STEP_SEC、最多翻 MAX_STEPS 格
-ROW_DELAY, CHAR_DELAY, STEP_SEC, MAX_STEPS = 0.08, 0.02, 0.035, 18
+ROW_DELAY, CHAR_DELAY, STEP_SEC, MAX_STEPS = 0.05, 0.02, 0.035, 18
 FLIP_SEC = 2.0            # 須 ≥ 列數×ROW_DELAY + 字數×CHAR_DELAY + MAX_STEPS×STEP_SEC
 ALNUM = " ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.,+-%^=/&…"  # 字輪順序
 CJK = "台積電鴻海聯發科美股日韓總經指數黃金原油"  # 全形字轉這池，寬度才不會跳
 FIXED_LINES = 5           # 大盤 2 行 + 頁籤 + 表頭 + 細線，剩下的高度放個股
-AUTO_SEC = 8              # 自動翻頁間隔；手動切頁會重新計時
+AUTO_SEC = 12             # 自動翻頁間隔；手動切頁會重新計時
 TAB_GAP = " " * 4          # 頁籤之間的空白
 INDEX_SWAP_SEC = 4        # 大盤第二行在幅度 / 漲跌點數之間輪流切換的秒數
 
@@ -353,6 +355,29 @@ def market_hours():
     return asia or us
 
 
+tick_at = {}   # symbol -> (跳動時間, +1 漲 / -1 跌)
+seen_px = {}   # symbol -> 上一輪看到的價格；第一次看到不算跳動，免得開面板時整片閃
+
+
+def mark_ticks():
+    """poller 抓完一輪後比對價格，有動的記時間戳，stock_table 據此亮燈。
+    放在這裡而不是各個 fetch 裡：Yahoo、證交所、盤中即時價三條來源都會經過這一點。"""
+    now = time.time()
+    for sym, q in list(quotes.items()):
+        price, old = q[0], seen_px.get(sym)
+        if old is not None and price != old:
+            tick_at[sym] = (now, 1 if price > old else -1)
+        seen_px[sym] = price
+
+
+def tick_style(sym):
+    """還在亮燈時間內就回傳反白樣式，否則 None 交給原本的漲跌色。"""
+    tk = tick_at.get(sym)
+    if not tk or time.time() - tk[0] >= TICK_SEC:
+        return None
+    return TICK_UP if tk[1] > 0 else TICK_DOWN
+
+
 def poller():
     global last_update
     with ThreadPoolExecutor(8) as pool:
@@ -371,6 +396,7 @@ def poller():
                 fetch_twse(syms)
             except Exception:
                 pass  # 證交所連不上就先用 Yahoo 的延遲價
+            mark_ticks()
             last_update = time.time()
             time.sleep(REFRESH_SEC if market_hours() else IDLE_SEC)
 
@@ -550,7 +576,8 @@ def stock_table(hold, show_spark, new_rows, old_rows, t, span):
             bar.highlight_words(["●"], row[7] or FLAT)
         if old_rows is None:
             table.add_row(Text(row[0], NAME), Text(row[1], SYMBOL), bar, Text(row[3], row[8]),
-                          *(Text(c, row[7] or "") for c in row[4:7]))
+                          Text(row[4], tick_style(row[1]) or row[7] or ""),
+                          *(Text(c, row[7] or "") for c in row[5:7]))
             continue
         old = old_rows[i] if i < len(old_rows) else blank
         flips = [Text(solari(o, c, t, i * ROW_DELAY), FLIPPING) for o, c in zip(old[:7], row[:7])]
