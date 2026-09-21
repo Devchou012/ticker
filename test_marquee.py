@@ -41,6 +41,23 @@ def demo():
     names = [name for _, name, _, _ in m.movers()]
     assert "美國利率" not in names, "央行利率不該進異動榜"
     assert names.count("SK海力士") == 1, "跨頁重複的代號只該算一次"
+    # 盤中的市場優先：台股開盤時美股不該上榜，全收盤時才退回來用
+    m.quotes.clear()
+    m.quotes["2330.TW"] = (1500.0, 1400.0)   # 台股 +7%
+    m.quotes["NVDA"] = (200.0, 100.0)        # 美股 +100%，幅度大得多
+    tw_open = m.session_open("2330.TW")
+    us_open = m.session_open("NVDA")
+    names = [name for _, name, _, _ in m.movers()]
+    if tw_open and not us_open:
+        assert names == ["台積電"], f"台股盤中不該出現美股，得到 {names}"
+    elif us_open and not tw_open:
+        assert names == ["NVIDIA"], f"美股盤中不該出現台股，得到 {names}"
+    else:
+        assert set(names) == {"台積電", "NVIDIA"}, f"兩邊都開或都關時應一起排，得到 {names}"
+
+    m.quotes.clear()
+    m.quotes["2330.TW"] = (1500.0, 1400.0)
+    assert [n for _, n, _, _ in m.movers()] == ["台積電"], "全收盤也要退回來顯示，不能空"
     print("跑馬燈 ok")
 
 

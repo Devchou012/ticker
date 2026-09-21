@@ -699,8 +699,10 @@ def clicked_market(x, y):
 
 def movers(n=MARQUEE_TOP):
     """全部頁面的標的裡，依漲跌幅絕對值取前 n 名。跨頁重複的代號只算一次。
+    盤中的市場優先：白天是台股、日韓，晚上是美股。收盤的市場價格整天不動，
+    掛在榜上只是佔位子；全部收盤時（半夜、週末）才退回來用它們，免得整條空白。
     央行利率排除：它的漲跌是跟上次決議比，一放進來就永遠佔著榜首。"""
-    seen, out = set(), []
+    seen, live, rest = set(), [], []
     for items in PAGES.values():
         for sym, name in items:
             q = quotes.get(sym)
@@ -709,9 +711,11 @@ def movers(n=MARQUEE_TOP):
             seen.add(sym)
             price, prev, *extra = q
             vr = volume_ratio(sym, *extra[:2])[1] if extra else ""
-            out.append((abs(price - prev) / prev, name, (price - prev) / prev, vr == VOL_HOT_STYLE))
-    out.sort(reverse=True)
-    return out[:n]
+            row = (abs(price - prev) / prev, name, (price - prev) / prev, vr == VOL_HOT_STYLE)
+            (live if session_open(sym) else rest).append(row)
+    live.sort(reverse=True)
+    rest.sort(reverse=True)
+    return (live or rest)[:n]
 
 
 def marquee_body():
