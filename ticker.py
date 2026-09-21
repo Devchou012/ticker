@@ -170,7 +170,10 @@ ALNUM = " ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.,+-%^=/
 CJK = "台積電鴻海聯發科美股日韓總經指數黃金原油"  # 全形字轉這池，寬度才不會跳
 FIXED_LINES = 5           # 大盤 2 行 + 頁籤 + 表頭 + 細線，剩下的高度放個股
 # 底部跑馬燈：左邊固定幾個總經數字，右邊捲動全市場異動。用 draw() 留的那一行，寬度不能寫滿
-MARQUEE_CPS = 10     # 每秒捲幾格
+FRAME_SEC = 0.05     # 主迴圈一幀多久；睡到下一個邊界，幀落點才不會飄
+MARQUEE_FRAMES = 2   # 每幾幀捲一格。終端最小只能移一整格，所以速度只有 1/FRAME_SEC 除以
+                     # 整數這幾檔（20、10、6.7…）。中間值會變成一下動一下不動，那才是頓的來源，
+                     # 跟快慢無關；幀率不受這個值影響
 MARQUEE_TOP = 10     # 異動排行取前幾名
 MARQUEE_GAP = "    ·    "  # 捲動內容首尾之間的間隔，接回去才看得出斷點
 MARQUEE_MIN = 120    # 窄於這個寬度就不放固定段，整條都給捲動
@@ -783,7 +786,7 @@ def marquee(width):
     scroll = loop.copy()
     while cell_len(scroll.plain) < rest + span:  # 接夠長，切到尾巴時後面還有內容接上
         scroll.append_text(loop)
-    head.append_text(clip_cells(scroll, int(time.time() * MARQUEE_CPS) % span, rest))
+    head.append_text(clip_cells(scroll, int(time.time() / FRAME_SEC) // MARQUEE_FRAMES % span, rest))
     return head
 
 
@@ -886,7 +889,7 @@ def main():
                 shown = time.time()
             if not pending:
                 draw(console, render(names[idx]))
-                time.sleep(0.05)
+                time.sleep(FRAME_SEC - time.time() % FRAME_SEC)  # 睡到下一個幀邊界，跑馬燈才勻速
     finally:
         console.file.write("\x1b[?25h\x1b[?1000l\x1b[?1006l")  # q 離開時把游標、滑鼠還回來
 
