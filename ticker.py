@@ -169,7 +169,14 @@ FLIP_SEC = 2.0            # 須 ≥ 列數×ROW_DELAY + 字數×CHAR_DELAY + MAX
 ALNUM = " ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.,+-%^=/&…"  # 字輪順序
 CJK = "台積電鴻海聯發科美股日韓總經指數黃金原油"  # 全形字轉這池，寬度才不會跳
 FIXED_LINES = 5           # 大盤 2 行 + 頁籤 + 表頭 + 細線，剩下的高度放個股
-AUTO_SEC = 12             # 自動翻頁間隔；手動切頁會重新計時
+# 底部跑馬燈：左邊固定幾個總經數字，右邊捲動全市場異動。用 draw() 留的那一行，寬度不能寫滿
+MARQUEE_CPS = 10     # 每秒捲幾格
+MARQUEE_TOP = 10     # 異動排行取前幾名
+MARQUEE_GAP = "    ·    "  # 捲動內容首尾之間的間隔，接回去才看得出斷點
+MARQUEE_MIN = 120    # 窄於這個寬度就不放固定段，整條都給捲動
+MARQUEE_FIXED = [("DX-Y.NYB", "DXY"), ("BZ=F", "Brent"), ("GC=F", "Gold"),
+                 ("^VIX", "VIX"), ("^TNX", "10Y")]
+AUTO_SEC = 20             # 自動翻頁間隔；手動切頁會重新計時
 TAB_GAP = " " * 4          # 頁籤之間的空白
 INDEX_SWAP_SEC = 4        # 大盤第二行在幅度 / 漲跌點數之間輪流切換的秒數
 
@@ -690,6 +697,92 @@ def clicked_market(x, y):
     return min(centers, key=lambda p: abs(centers[p] - x))
 
 
+def movers(n=MARQUEE_TOP):
+    """全部頁面的標的裡，依漲跌幅絕對值取前 n 名。跨頁重複的代號只算一次。
+    央行利率排除：它的漲跌是跟上次決議比，一放進來就永遠佔著榜首。"""
+    seen, out = set(), []
+    for items in PAGES.values():
+        for sym, name in items:
+            q = quotes.get(sym)
+            if sym in seen or sym in RATES or not q or not q[1]:
+                continue
+            seen.add(sym)
+            price, prev, *extra = q
+            vr = volume_ratio(sym, *extra[:2])[1] if extra else ""
+            out.append((abs(price - prev) / prev, name, (price - prev) / prev, vr == VOL_HOT_STYLE))
+    out.sort(reverse=True)
+    return out[:n]
+
+
+def marquee_body():
+    """捲動段：異動排行。漲紅跌綠，爆量的補一個閃電。"""
+    t = Text()
+    for _, name, pct, hot in movers():
+        t.append("▲ " if pct > 0 else "▼ ", UP if pct > 0 else DOWN)
+        t.append(name, NAME)
+        t.append(f" {pct:+.2%}", UP if pct > 0 else DOWN)
+        if hot:
+            t.append(" ⚡", VOL_HOT_STYLE)
+        t.append("   ")
+    return t
+
+
+def marquee_head():
+    """固定段：幾個看大環境的數字，不捲動。"""
+    t = Text()
+    for sym, label in MARQUEE_FIXED:
+        q = quotes.get(sym)
+        if not q or not q[1]:
+            continue
+        price, prev = q[0], q[1]
+        pct = (price - prev) / prev
+        t.append(f"{label} ", SYMBOL)
+        t.append(f"{price:,.2f} ", NAME)
+        t.append(f"{pct:+.2%}", UP if pct > 0 else DOWN if pct < 0 else FLAT)
+        t.append("  ")
+    return t
+
+
+def clip_cells(t, start, width):
+    """Text 依「顯示格」切片：全形字算兩格。切點落在全形字中間就補一個空白，
+    不然捲動時整條會左右抖一格。尾巴補空白填滿，殘影才不會留在後面。"""
+    w = [2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in t.plain]
+    pos = i = 0
+    while i < len(w) and pos + w[i] <= start:
+        pos += w[i]
+        i += 1
+    out = Text()
+    if pos < start and i < len(w):  # start 卡在全形字中間
+        out.append(" " * (pos + w[i] - start))
+        pos, i = pos + w[i], i + 1
+    used, j = cell_len(out.plain), i
+    while j < len(w) and used + w[j] <= width:
+        used += w[j]
+        j += 1
+    out.append_text(t[i:j])
+    out.append(" " * max(0, width - used))
+    return out
+
+
+def marquee(width):
+    """組一整行：固定段 + 捲動段，總寬剛好 width。"""
+    head = marquee_head() if width >= MARQUEE_MIN else Text()
+    if head.plain:
+        head.append("│ ", RULE)
+    rest = width - cell_len(head.plain)
+    body = marquee_body()
+    if not body.plain:
+        return head.append(" " * max(0, rest))
+    loop = body.copy()
+    loop.append(MARQUEE_GAP, RULE)
+    span = cell_len(loop.plain)
+    scroll = loop.copy()
+    while cell_len(scroll.plain) < rest + span:  # 接夠長，切到尾巴時後面還有內容接上
+        scroll.append_text(loop)
+    head.append_text(clip_cells(scroll, int(time.time() * MARQUEE_CPS) % span, rest))
+    return head
+
+
 screen = []  # 上一幀每一行的純文字，給 clicked_market 反查頁籤位置
 
 
@@ -704,9 +797,13 @@ def draw(console, renderable):
     lines = buf.file.getvalue().split("\n")[:height]
     screen[:] = [ANSI.sub("", line) for line in lines]
     # \x1b[?2026h/l：同步更新，終端機等整幀寫完才換上，不會畫一半就顯示（撕裂）
+    bar = Console(file=io.StringIO(), width=width, force_terminal=True,
+                  color_system="truecolor", legacy_windows=False, no_color=False)
+    bar.print(marquee(width - 1), end="", crop=True, no_wrap=True)  # -1：不碰右下角那一格，碰了畫面會捲
     console.file.write("\x1b[?2026h\x1b[H"
                        + "\r\n".join(line + "\x1b[0m\x1b[K" for line in lines)
-                       + "\x1b[J\x1b[?2026l")
+                       + "\x1b[J\r\n" + bar.file.getvalue() + "\x1b[0m\x1b[K"
+                       + "\x1b[?2026l")
     console.file.flush()
 
 
