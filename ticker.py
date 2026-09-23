@@ -784,7 +784,9 @@ def rows_of(items, hold=False):
     return out
 
 
-COL_W = 108  # 一欄個股表至少要這麼寬，視窗夠寬就並排多欄，一頁塞更多檔
+# 欄寬全部寫死，版面不隨內容伸縮；價格三欄置中並靠左邊的籌碼欄，右邊剩下的寬度留給最後那個空欄
+NAME_W, SYM_W, PRICE_W, CHG_W, PCT_W = 13, 9, 9, 9, 8  # 名稱含前導空白，實際放得下 12 格
+COL_W = 100  # 一欄個股表至少要這麼寬（固定欄寬合計 87 + 每欄右側 1 格留白），視窗夠寬就並排多欄
 
 
 def views_for(height, width=COL_W):
@@ -822,16 +824,21 @@ def render(view, old_rows=None, t=1.0):
 
 def stock_table(hold, show_spark, new_rows, old_rows, t, span):
     """一欄個股表，放 span 範圍內的列。"""
-    table = Table(box=box.SIMPLE_HEAD, border_style=RULE, show_edge=False, expand=True, header_style=HEADER)
+    # padding 只留右邊那一格：預設左右各一格，11 欄就吃掉 22 格，欄跟欄之間會散開
+    table = Table(box=box.SIMPLE_HEAD, border_style=RULE, show_edge=False, expand=True,
+                  header_style=HEADER, padding=(0, 1, 0, 0))
     # ratio 讓欄寬只看視窗寬度、不看內容，翻牌時才不會伸縮
-    for col, just, ratio in (("名稱", "left", 3), ("代號", "left", 2),
-                             ("當日走勢" if show_spark else "今日區間", "center", 2), ("量比", "right", 1),
-                             ("乖離", "right", 1), ("52W", "right", 1), ("外資", "right", 1),
-                             ("價格", "right", 3),
-                             ("今日損益" if hold else "漲跌", "right", 2), ("總報酬" if hold else "幅度", "right", 2)):
+    for col, just, ratio in ((" 名稱", "left", 3), ("代號", "left", 2),  # 名稱帶一格前導空白，不然會貼齊窗格邊
+                             ("當日走勢" if show_spark else "今日區間", "center", 2), ("量比", "center", 1),
+                             ("乖離", "center", 1), ("年區間", "center", 1), ("外資", "center", 1),
+                             ("價格", "center", 3),
+                             ("今日損益" if hold else "漲跌", "center", 2),
+                             ("總報酬" if hold else "幅度", "center", 2),
+                             ("", "left", 1)):  # 最後這欄只是留白，之後要加東西就放這裡
         table.add_column(Text(col, justify=just), justify=just, ratio=ratio, no_wrap=True)  # 標題跟內容同邊對齊
-    table.columns[1].min_width = 11
-    for i, w in ((2, RANGE_W), (3, 5), (4, 7), (5, 5), (6, 5)):  # 區間條、量比、位階、籌碼固定寬度，ratio 欄會無視 min_width 把它們壓成「…」
+    # 最後那欄不設寬度，ratio 會把剩下的空間全給它
+    for i, w in ((0, NAME_W), (1, SYM_W), (2, RANGE_W), (3, 5), (4, 7), (5, 6), (6, 5),
+                 (7, PRICE_W), (8, CHG_W), (9, PCT_W)):
         table.columns[i].ratio, table.columns[i].width = None, w
     for i in span:
         blank = ("", "", "", "", "", "", "", None, "", ("", []), "", "", "", "", "", "")
@@ -850,17 +857,18 @@ def stock_table(hold, show_spark, new_rows, old_rows, t, span):
             bar = Text(row[2] + "\n" * (SPARK_ROWS - 1), line)  # 補空行，兩種顯示列高一樣
             bar.highlight_words(["●"], f"not dim {row[7]}" if row[7] else FLAT)
         if old_rows is None:
-            table.add_row(Text(row[0], NAME), Text(row[1], SYMBOL), bar, Text(row[3], row[8]),
+            table.add_row(Text(" " + row[0], NAME), Text(row[1], SYMBOL), bar, Text(row[3], row[8]),
                           Text(row[10], row[11]), Text(row[12], row[13]), Text(row[14], row[15]),
                           Text(row[4], tick_style(row[1]) or row[7] or ""),
-                          *(Text(c, row[7] or "") for c in row[5:7]))
+                          *(Text(c, row[7] or "") for c in row[5:7]), Text(""))
             continue
         old = old_rows[i] if i < len(old_rows) else blank
         flips = [Text(solari(o, c, t, i * ROW_DELAY), FLIPPING) for o, c in zip(old[:7], row[:7])]
         flips[2] = bar  # 區間條是線條符號，不進字輪，直接換新
+        flips[0] = Text(" " + flips[0].plain, FLIPPING)  # 翻牌中也要留著那一格
         # 位階、籌碼是每天才變一次的數字，不進字輪，跟區間條一樣直接換
         extra = [Text(row[10], row[11]), Text(row[12], row[13]), Text(row[14], row[15])]
-        table.add_row(*flips[:4], *extra, *flips[4:])
+        table.add_row(*flips[:4], *extra, *flips[4:], Text(""))
     return table
 
 
