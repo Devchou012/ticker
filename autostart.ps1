@@ -9,6 +9,6 @@ $running = Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
 if ($running) { exit 0 }  # ticker.py 另有單一實例鎖，多開會自己關窗格
 
 # New pane opens below and takes focus; swap it up, then give focus back to Claude Code.
-# swap-pane swaps contents, not sizes: new pane must be 0.75 so Claude lands in the 75% slot.
-wt -w 0 split-pane -H --size 0.75 python "$PSScriptRoot\ticker.py" `; swap-pane up `; move-focus down
+# swap-pane swaps contents, not sizes: new pane must be 0.55 so Claude lands in the 55% slot.
+wt -w 0 split-pane -H --size 0.55 python "$PSScriptRoot\ticker.py" `; swap-pane up `; move-focus down
 exit 0
