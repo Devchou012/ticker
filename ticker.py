@@ -193,6 +193,7 @@ DEV_COLD = "bold #000000 on #26c6da"  # 回檔用青底
 POS_HOT, POS_COLD = 90, 10            # 52 週位置的高低帶，超過就上色
 # 籌碼：外資買賣超連續天數。證交所 T86 收盤後才更新，一小時抓一次就夠
 DAILY_BATCH, DAILY_GAP = 25, 2.0   # 日線分批下載的批量與批間隔，一次全丟會被擋
+KBARS = 90        # daily.json 每檔存幾根開高低收；90 根約四個月，K 線面板畫得完
 CHIP_FILE = Path(__file__).with_name("chips.json")
 # ponytail: chips.json 存全市場（約 230KB），不是只存名單內的。觀察清單隨時會加新股，
 # 只存名單內的話新加的那檔就沒有歷史可以算連續天數。嫌大再改成按名單裁切
@@ -209,9 +210,12 @@ VOL_ALERT = 3.0       # 量比超過這個倍數就自動報一次
 ALERT_STYLE = "bold #000000 on #ff3b3b"
 
 quotes = {}  # symbol -> (price, prev_close)
+zoom = 0          # ZOOMS 的索引，+ / - 切換 K 棒寬度
+sel_sym = None    # 右側 K 線面板顯示哪一檔
 daily = {}        # symbol -> (ma20, ma60, low52, high52)
 daily_date = ""   # 日線統計是哪一天抓的
 daily_busy = False  # 背景在抓日線時不要再開一條
+bars = {}         # symbol -> [[開, 高, 低, 收], ...]，最近 KBARS 根，給 K 線面板用
 chips = {}        # 日期 -> {證券代號: 外資買賣超張數}
 chips_at = 0.0
 alert_msgs = []   # [(觸發時間, 文字)]，跑馬燈左邊插播
@@ -274,26 +278,6 @@ def fetch_twse(syms):
             avg = old[3] if len(old) > 3 else None
             vol = float(r["v"]) * 1000 if r.get("v") else None  # MIS 成交量單位是張
             quotes[sym] = (price, prev, vol, avg, float(r["l"]), float(r["h"]))
-            mark_live(sym, price)
-
-
-def mark_live(sym, price):
-    """盤中把證交所即時價記到現在這個時段格，走勢圖最右邊就不會落後。"""
-    start, length = SESSIONS.get(suffix_of(sym), (None, None))
-    now = time.localtime()
-    mins = now.tm_hour * 60 + now.tm_min - (start or 0)
-    if start is None or now.tm_wday >= 5 or not 0 <= mins < length:
-        return
-    cell = min(int(mins / length * RANGE_W * 2), RANGE_W * 2 - 1)
-    today = time.strftime("%Y%m%d")
-    day, marks = live.get(sym, (today, {}))
-    if day != today:
-        marks = {}
-    marks[cell] = price
-    live[sym] = (today, marks)
-    cells = intraday.get(sym)
-    if cells and all(c is None for c in cells[cell + 1:]):  # 只接在已有資料的後面，不改 Yahoo 那段
-        cells[cell] = price
 
 
 # 央行利率不是盤中報價：美國抓 FRED 的聯邦基金目標區間上限，日本、台灣抓 Trading Economics
@@ -427,11 +411,6 @@ def poller():
     global last_update
     with ThreadPoolExecutor(8) as pool:
         while True:
-            if time.time() - intraday_at >= INTRADAY_SEC:
-                try:
-                    fetch_intraday()
-                except Exception:
-                    pass  # 分時抓不到不影響即時報價
             syms = [s for rows in [INDICES, *PAGES.values()] for s, _ in rows]
             # 收盤的市場價格不會再動，跳過可以少掉夜裡大半的請求，免得被 Yahoo 限流。
             # 還沒抓到過的照抓，不然剛開面板時收盤市場會整片空白
@@ -460,86 +439,9 @@ def poller():
             time.sleep(REFRESH_SEC if market_hours() else IDLE_SEC)
 
 
-SPARK_ROWS = 2  # 走勢圖幾行高，每檔個股也跟著佔這麼多行
-RANGE_W = 16  # 走勢欄寬度（字數）：區間條與分時走勢共用，換顯示不會改版面
-SPARK_SWAP_SEC = 5   # 區間條 / 分時走勢輪流切換的秒數
+ROW_LINES = 1   # 個股表每列幾行。走勢圖搬走後一列只要一行，同樣高度能多看一倍的檔數
+RANGE_W = 16  # 今日區間條與類股強弱條的寬度（字數）
 HEAT_FULL = 0.02     # 類股強弱條滿格的漲跌幅；類股指數一天動 2% 已經是很大的輪動
-INTRADAY_SEC = 60    # 分時資料重抓間隔
-intraday = {}        # symbol -> 收盤價（交易時段切成 RANGE_W*2 個時間點，未到的是 None）
-intraday_at = 0.0
-live = {}            # symbol -> (日期, {時段格: 證交所即時價})，補 Yahoo 延遲的那一段
-
-
-def fetch_intraday():
-    """當日分時走勢（江波圖）：5 分 K 收盤價，依時間落到固定的時段格子裡。"""
-    global intraday_at
-    syms = sorted({s for rows in PAGES.values() for s, _ in rows if s not in FUTURES and s not in RATES and s not in SECTOR_SET})
-    data = yf.download(syms, period="1d", interval="5m", group_by="ticker",
-                       threads=True, progress=False, auto_adjust=False)
-    for sym in syms:
-        try:
-            close = data[sym]["Close"].dropna()
-            if close.empty:
-                continue
-            length = SESSIONS.get(suffix_of(sym), (0, 1440))[1]  # 期貨、匯率、加密幣近乎 24 小時交易
-            open_at = close.index[0]
-            cells = [None] * (RANGE_W * 2)  # 一格兩個時間點
-            for stamp, value in close.items():
-                mins = (stamp - open_at).total_seconds() / 60
-                cells[min(int(mins / length * RANGE_W * 2), RANGE_W * 2 - 1)] = float(value)
-            # Yahoo 台股晚約 20 分鐘：最後幾格改用面板自己記下的證交所即時價接上
-            day, marks = live.get(sym, (None, {}))
-            if day == time.strftime("%Y%m%d"):
-                last = max((i for i, c in enumerate(cells) if c is not None), default=-1)
-                for i, price in marks.items():
-                    if i > last:
-                        cells[i] = price
-            intraday[sym] = cells
-        except (KeyError, TypeError, ValueError):
-            pass  # 抓不到就沒有走勢圖，其他欄照常
-    intraday_at = time.time()
-
-
-def spark(sym, price, prev):
-    """當日走勢：一格畫兩個時間點（點字左右兩欄），高度看當天區間，紅綠看昨收上下。"""
-    cells = intraday.get(sym)
-    if not cells or not prev:
-        return "", []
-    seen = [c for c in cells if c is not None]
-    if not seen:
-        return "", []
-    cells = cells[:]
-    cells[max(i for i, c in enumerate(cells) if c is not None)] = price  # 最新那格用現價
-    low, high = min(seen + [price, prev]), max(seen + [price, prev])  # 昨收一定在圖內，當填色的基準線
-    span = (high - low) or 1
-    top = SPARK_ROWS * 4 - 1
-    rows = [None if v is None else top - round((v - low) / span * top) for v in cells]  # 0 最上
-    base = top - round((prev - low) / span * top)
-    # 點字一個字有 4 列 2 欄，左欄畫前半段、右欄畫後半段；疊 SPARK_ROWS 行字，高度就是 4 倍
-    bits = ((0x01, 0x02, 0x04, 0x40), (0x08, 0x10, 0x20, 0x80))
-    lines, styles, last_row = [""] * SPARK_ROWS, [], None
-    for i in range(0, len(cells), 2):
-        pair = cells[i:i + 2]
-        if all(v is None for v in pair):  # 還沒走到的時段用點標出時間軸（畫在昨收那行）
-            for k in range(SPARK_ROWS):
-                lines[k] += "·" if k == base // 4 else "⠀"  # 空白點字，不會被置中對齊吃掉
-            styles.append(RULE_BAR)
-            continue
-        dots = [0] * SPARK_ROWS
-        for col in range(2):
-            row = rows[i + col]
-            if row is None:
-                continue
-            # 從線（含跟前一點的落差）填到昨收：漲的往下填、跌的往上填
-            start = row if last_row is None else last_row
-            for r in range(min(start, row, base), max(start, row, base) + 1):
-                dots[r // 4] |= bits[col][r % 4]
-            last_row = row
-        for k in range(SPARK_ROWS):
-            lines[k] += chr(0x2800 + dots[k])
-        last = [v for v in pair if v is not None][-1]
-        styles.append(UP if last > prev else DOWN if last < prev else FLAT)
-    return "\n".join(lines), styles
 
 
 def heat_bar(pct):
@@ -565,6 +467,7 @@ def load_daily():
     except (OSError, ValueError):
         return
     daily.update({k: tuple(v) for k, v in blob.get("stats", {}).items()})
+    bars.update(blob.get("bars", {}))
     daily_date = blob.get("date", "")
 
 
@@ -596,17 +499,20 @@ def fetch_daily():
             continue  # 這批沒拿到就算了，明天再抓
         for sym in batch:
             try:
-                vals = [float(v) for v in data[sym]["Close"].dropna()]
+                df = data[sym][["Open", "High", "Low", "Close"]].dropna()
+                vals = [float(v) for v in df["Close"]]
             except (KeyError, TypeError, ValueError):
                 continue
             if len(vals) < 20:
                 continue  # 剛上市的沒有均線可算
             ma60 = sum(vals[-60:]) / 60 if len(vals) >= 60 else None
             daily[sym] = (sum(vals[-20:]) / 20, ma60, min(vals), max(vals))
+            # K 線面板要的開高低收；只留最近 KBARS 根，畫得完的部分就夠了
+            bars[sym] = [[round(float(x), 4) for x in row] for row in df.values[-KBARS:]]
         time.sleep(DAILY_GAP)
     try:
-        DAILY_FILE.write_text(json.dumps({"date": daily_date, "stats": daily}, ensure_ascii=False),
-                              encoding="utf-8")
+        DAILY_FILE.write_text(json.dumps({"date": daily_date, "stats": daily, "bars": bars},
+                                        ensure_ascii=False), encoding="utf-8")
     except OSError:
         pass
 
@@ -758,10 +664,10 @@ def rows_of(items, hold=False):
     out = []
     for sym, name in items:
         q = quotes.get(sym)
-        # 列格式：(名稱, 代號, 區間條, 量比, 價格, 漲跌, 幅度, 漲跌色, 量比色, 日線圖,
+        # 列格式：(名稱, 代號, 區間條, 量比, 價格, 漲跌, 幅度, 漲跌色, 量比色,
         #        乖離, 乖離色, 52週位置, 位置色, 外資連續天數, 籌碼色)
         if not q or not q[1]:
-            out.append((name, sym, "", "", "…", "", "", None, "", ("", []), "", "", "", "", "", ""))
+            out.append((name, sym, "", "", "…", "", "", None, "", "", "", "", "", "", ""))
             continue
         price, prev, *extra = q
         chg = price - prev
@@ -769,7 +675,6 @@ def rows_of(items, hold=False):
         rb = range_bar(price, *extra[2:]) if extra else ""
         if sym in SECTOR_SET:
             rb = heat_bar(chg / prev)  # 類股沒有個股那種今日區間，這一欄改放強弱條
-        sp = spark(sym, price, prev)
         dev, dev_style = bias(sym, price)
         pos, pos_style = pos52(sym, price)
         chip, chip_style = chip_streak(sym)
@@ -777,21 +682,133 @@ def rows_of(items, hold=False):
             shares, cost = HOLD[sym]
             ret = (price - cost) / cost
             color = UP if ret > 0 else DOWN if ret < 0 else FLAT
-            out.append((name, sym, rb, vr, f"{price:,.2f}", f"{chg * shares:+,.0f}", f"{ret:+.2%}", color, vr_style, sp, dev, dev_style, pos, pos_style, chip, chip_style))
+            out.append((name, sym, rb, vr, f"{price:,.2f}", f"{chg * shares:+,.0f}", f"{ret:+.2%}", color, vr_style, dev, dev_style, pos, pos_style, chip, chip_style))
             continue
         color = UP if chg > 0 else DOWN if chg < 0 else FLAT
-        out.append((name, sym, rb, vr, f"{price:,.2f}", f"{chg:+,.2f}", f"{chg / prev:+.2%}", color, vr_style, sp, dev, dev_style, pos, pos_style, chip, chip_style))
+        out.append((name, sym, rb, vr, f"{price:,.2f}", f"{chg:+,.2f}", f"{chg / prev:+.2%}", color, vr_style, dev, dev_style, pos, pos_style, chip, chip_style))
     return out
 
 
 # 欄寬全部寫死，版面不隨內容伸縮；價格三欄置中並靠左邊的籌碼欄，右邊剩下的寬度留給最後那個空欄
 NAME_W, SYM_W, PRICE_W, CHG_W, PCT_W = 13, 9, 9, 9, 8  # 名稱含前導空白，實際放得下 12 格
-COL_W = 100  # 一欄個股表至少要這麼寬（固定欄寬合計 87 + 每欄右側 1 格留白），視窗夠寬就並排多欄
+COL_W = 104  # 一欄個股表至少要這麼寬（欄寬 87 + 欄間留白 11 + 外層 grid 留白 4 + 留白欄 1），不夠就會截字
+
+
+# 右側 K 線面板：選中那一檔的日 K。K 棒顏色代表它站在哪條均線上，均線本身不畫線——
+# 終端機一格只能放一個字元，畫上去就會把 K 棒吃掉，數值改寫在圖下面那一行
+KPANEL_MIN, KPANEL_MAX = 56, 120  # 面板寬度上下限；窗格不夠寬就整個收起來
+KPANEL_FIXED = 2      # K 線圖以外固定佔幾行：標題與均線各一行
+ZOOMS = ((2, 1), (1, 1), (3, 2))  # (每根佔幾格, 棒身幾格)，+ / - 切換
+BAR_UP, BAR_MID, BAR_DOWN = "bold #ff3b3b", "#c62828", "bold #00e676"  # 站上季線／只站上月線／跌破月線
+# 上下半格字元：一格塞兩個價格層級，垂直解析度就是行數的兩倍
+CELLS = {0: " ", 1: "╵", 2: "╷", 3: "│", 4: "▀", 5: "▀", 6: "▀", 7: "▀",
+         8: "▄", 9: "▄", 10: "▄", 11: "▄", 12: "█", 13: "█", 14: "█", 15: "█"}
+BITS = {" ": 0, "╵": 1, "╷": 2, "│": 3, "▀": 4, "▄": 8, "█": 12}
+
+
+def kline(sym, width, rows):
+    """K 線本體，回傳 (每列文字, 每列每格的樣式, 畫了幾根)。棒身佔 body 格、每根隔 step 格。"""
+    data = bars.get(sym)
+    step, body = ZOOMS[zoom]
+    if not data or rows < 3 or width < step:
+        return [], [], 0
+    n = min(len(data), width // step)
+    view = data[-n:]
+    lo, hi = min(b[2] for b in view), max(b[1] for b in view)
+    span = (hi - lo) or 1
+    sub = rows * 2
+    lvl = lambda p: min(sub - 1, max(0, int((p - lo) / span * (sub - 1))))
+    grid = [[" "] * width for _ in range(rows)]
+    style = [[""] * width for _ in range(rows)]
+    closes = [b[3] for b in data]
+    for i, (o, h, l, c) in enumerate(view):
+        j = len(closes) - n + i  # 均線要用這根當下的值，不是最新的
+        ma20 = sum(closes[max(0, j - 19):j + 1]) / min(20, j + 1)
+        ma60 = sum(closes[max(0, j - 59):j + 1]) / min(60, j + 1)
+        st = BAR_UP if c >= ma60 and c >= ma20 else BAR_MID if c >= ma20 else BAR_DOWN
+        x0 = i * step
+        bt, bb = lvl(max(o, c)), lvl(min(o, c))
+        for k in range(lvl(l), lvl(h) + 1):
+            r, half = rows - 1 - k // 2, k % 2
+            solid = bb <= k <= bt  # 實體畫滿棒寬，影線只畫中間那一格
+            xs = range(x0, min(x0 + body, width)) if solid else [min(x0 + body // 2, width - 1)]
+            for x in xs:
+                grid[r][x] = CELLS[BITS.get(grid[r][x], 0) | ((4 if half else 8) if solid else (1 if half else 2))]
+                style[r][x] = st
+    return ["".join(r) for r in grid], style, n
+
+
+def kline_panel(width, rows):
+    """面板整體：標題、K 線、均線數值、當日走勢、今日區間。"""
+    q = quotes.get(sel_sym) if sel_sym else None
+    if not sel_sym or not q or not q[1] or sel_sym not in bars:
+        hint = "還在抓日線資料" if sel_sym else "點左邊任一列看它的日 K"
+        return Group(Text("│ ", RULE).append(hint, SYMBOL))
+    price, prev = q[0], q[1]
+    chg = price - prev
+    color = UP if chg > 0 else DOWN if chg < 0 else FLAT
+    name = next((n for items in PAGES.values() for s, n in items if s == sel_sym), sel_sym)
+    lines, styles, n = kline(sel_sym, width - 2, max(3, rows - KPANEL_FIXED))  # -2：分隔線與左留白
+    head = Text(" ")
+    head.append(f"{name} ", NAME)
+    head.append(f"{sel_sym}   ", SYMBOL)
+    head.append(f"{price:,.2f}  ", color)
+    head.append(f"{chg:+,.2f}  {chg / prev:+.2%}", color)
+    head.append(f"   日K {n} 根  ×{ZOOMS[zoom][0]}", SYMBOL)
+    out = [head]
+    for row, st in zip(lines, styles):
+        t = Text(" " + row)
+        for x, s in enumerate(st):
+            if s:
+                t.stylize(s, x + 1, x + 2)
+        out.append(t)
+    closes = [b[3] for b in bars[sel_sym]]
+    view = bars[sel_sym][-n:] or bars[sel_sym]
+    ma = Text(" ")
+    for label, k in (("MA5", 5), ("MA20", 20), ("MA60", 60)):
+        if len(closes) >= k:
+            ma.append(f"{label} ", SYMBOL)
+            ma.append(f"{sum(closes[-k:]) / k:,.0f}   ", NAME)
+    ma.append("高 ", SYMBOL)
+    ma.append(f"{max(b[1] for b in view):,.0f}   ", NAME)
+    ma.append("低 ", SYMBOL)
+    ma.append(f"{min(b[2] for b in view):,.0f}", NAME)
+    out.append(ma)
+    return Group(*(Text("│", RULE).append_text(t) for t in out))  # 每一行前面補一條分隔線
+
+
+def sel_items(items):
+    """確保 sel_sym 落在這一頁裡；換頁或第一次進來就選第一檔。"""
+    global sel_sym
+    syms = [s for s, _ in items]
+    if sel_sym not in syms:
+        sel_sym = syms[0] if syms else None
+    return syms
+
+
+def move_sel(items, step):
+    global sel_sym
+    syms = sel_items(items)
+    if syms:
+        sel_sym = syms[(syms.index(sel_sym) + step) % len(syms)]
+
+
+def clicked_row(x, y, items, limit=None):
+    """點到哪一檔：從上一幀的純文字找代號，取水平位置最接近 x 的那一個。
+    limit 是表格右界，點在右側 K 線圖上不該改選股。"""
+    if limit and x > limit:
+        return None
+    if not 0 < y <= len(screen):
+        return None
+    line = screen[y - 1]
+    hits = [(s, cell_len(line[:line.index(s)]), cell_len(s)) for s, _ in items if s in line]
+    return min(hits, key=lambda z: abs(z[1] + z[2] / 2 - x))[0] if hits else None
+
 
 
 def views_for(height, width=COL_W):
     """依窗格高度、寬度把每個市場切成數個子頁：高度決定一欄幾檔，寬度決定並排幾欄。"""
-    rows = max(1, (height - FIXED_LINES) // SPARK_ROWS)
+    rows = max(1, (height - FIXED_LINES) // ROW_LINES)
     per = rows * max(1, width // COL_W)
     out = []
     for market, items in PAGES.items():
@@ -802,34 +819,40 @@ def views_for(height, width=COL_W):
     return out
 
 
-def render(view, old_rows=None, t=1.0):
+def render(view, old_rows=None, t=1.0, panel_w=0, height=0):
     market, items, label, per_col = view
+    sel_items(items)  # 換頁後 sel_sym 可能不在這一頁了
     # 頁籤拉開、左右留白，滑鼠比較好點
     tabs = TAB_GAP.join(f"[{TAB}]   {label}   [/]" if p == market else f"[{SYMBOL}]   {p}   [/]" for p in PAGES)
     age = int(time.time() - last_update) if last_update else "-"
     hold = market == "庫存"
-    show_spark = int(time.time() / SPARK_SWAP_SEC) % 2  # 區間條與日線圖輪流，欄寬一樣所以版面不動
     new_rows = rows_of(items, hold)
     n = max(len(new_rows), len(old_rows or []))
     # 第 i 檔放在第 i // per_col 欄；翻牌時新舊頁的同一格位置對得上
-    tables = [stock_table(hold, show_spark, new_rows, old_rows, t, range(c, min(c + per_col, n)))
-              for c in range(0, n, per_col)] or [stock_table(hold, show_spark, [], None, t, range(0))]
+    tables = [stock_table(hold, new_rows, old_rows, t, range(c, min(c + per_col, n)))
+              for c in range(0, n, per_col)] or [stock_table(hold, [], None, t, range(0))]
     grid = Table.grid(expand=True, padding=(0, 2))
     grid.title = f"{tabs}{TAB_GAP}[{SYMBOL}]· {age}s{' ⏸' if paused else ''}[/]"
     for _ in tables:
         grid.add_column(ratio=1)
     grid.add_row(*tables)
-    return Group(index_bar(), grid)
+    if not panel_w:
+        return Group(index_bar(), grid)
+    outer = Table.grid(expand=True)
+    outer.add_column()
+    outer.add_column(width=panel_w)
+    outer.add_row(grid, kline_panel(panel_w, max(4, height - 2)))  # -2：大盤列佔兩行
+    return Group(index_bar(), outer)
 
 
-def stock_table(hold, show_spark, new_rows, old_rows, t, span):
+def stock_table(hold, new_rows, old_rows, t, span):
     """一欄個股表，放 span 範圍內的列。"""
     # padding 只留右邊那一格：預設左右各一格，11 欄就吃掉 22 格，欄跟欄之間會散開
     table = Table(box=box.SIMPLE_HEAD, border_style=RULE, show_edge=False, expand=True,
                   header_style=HEADER, padding=(0, 1, 0, 0))
     # ratio 讓欄寬只看視窗寬度、不看內容，翻牌時才不會伸縮
     for col, just, ratio in ((" 名稱", "left", 3), ("代號", "left", 2),  # 名稱帶一格前導空白，不然會貼齊窗格邊
-                             ("當日走勢" if show_spark else "今日區間", "center", 2), ("量比", "center", 1),
+                             ("今日區間", "center", 2), ("量比", "center", 1),
                              ("乖離", "center", 1), ("年區間", "center", 1), ("外資", "center", 1),
                              ("價格", "center", 3),
                              ("今日損益" if hold else "漲跌", "center", 2),
@@ -841,24 +864,17 @@ def stock_table(hold, show_spark, new_rows, old_rows, t, span):
                  (7, PRICE_W), (8, CHG_W), (9, PCT_W)):
         table.columns[i].ratio, table.columns[i].width = None, w
     for i in span:
-        blank = ("", "", "", "", "", "", "", None, "", ("", []), "", "", "", "", "", "")
+        blank = ("", "", "", "", "", "", "", None, "", "", "", "", "", "", "")
         row = new_rows[i] if i < len(new_rows) else blank
-        if show_spark and row[9][0]:
-            bar = Text(row[9][0])
-            for j, style in enumerate(row[9][1]):  # 每一格自己上色：比前一天漲紅、跌綠
-                for k in range(SPARK_ROWS):
-                    at = k * (len(row[9][1]) + 1) + j
-                    bar.stylize(style, at, at + 1)
+        if row[1] in SECTOR_SET:
+            line = row[7] or RULE_BAR  # 類股強弱條整條都是色塊，不壓暗
         else:
-            if row[1] in SECTOR_SET:
-                line = row[7] or RULE_BAR  # 類股強弱條整條都是色塊，不壓暗
-            else:
-                line = f"dim {row[7]}".replace("bold ", "") if row[7] else RULE_BAR  # 線用漲跌同色的暗版，● 才是亮的
-            bar = Text(row[2] + "\n" * (SPARK_ROWS - 1), line)  # 補空行，兩種顯示列高一樣
-            bar.highlight_words(["●"], f"not dim {row[7]}" if row[7] else FLAT)
+            line = f"dim {row[7]}".replace("bold ", "") if row[7] else RULE_BAR  # 線用漲跌同色的暗版，● 才是亮的
+        bar = Text(row[2], line)
+        bar.highlight_words(["●"], f"not dim {row[7]}" if row[7] else FLAT)
         if old_rows is None:
             table.add_row(Text(" " + row[0], NAME), Text(row[1], SYMBOL), bar, Text(row[3], row[8]),
-                          Text(row[10], row[11]), Text(row[12], row[13]), Text(row[14], row[15]),
+                          Text(row[9], row[10]), Text(row[11], row[12]), Text(row[13], row[14]),
                           Text(row[4], tick_style(row[1]) or row[7] or ""),
                           *(Text(c, row[7] or "") for c in row[5:7]), Text(""))
             continue
@@ -867,7 +883,7 @@ def stock_table(hold, show_spark, new_rows, old_rows, t, span):
         flips[2] = bar  # 區間條是線條符號，不進字輪，直接換新
         flips[0] = Text(" " + flips[0].plain, FLIPPING)  # 翻牌中也要留著那一格
         # 位階、籌碼是每天才變一次的數字，不進字輪，跟區間條一樣直接換
-        extra = [Text(row[10], row[11]), Text(row[12], row[13]), Text(row[14], row[15])]
+        extra = [Text(row[9], row[10]), Text(row[11], row[12]), Text(row[13], row[14])]
         table.add_row(*flips[:4], *extra, *flips[4:], Text(""))
     return table
 
@@ -943,14 +959,14 @@ def read_key():
         return None
     k = msvcrt.getwch()
     if k in ("\x00", "\xe0"):
-        return {"K": "left", "M": "right"}.get(msvcrt.getwch())
+        return {"K": "left", "M": "right", "H": "up", "P": "down"}.get(msvcrt.getwch())
     if k != "\x1b":
         return k
     seq = ""
     while msvcrt.kbhit() and not (seq[-1:].isalpha() or seq[-1:] == "~"):
         seq += msvcrt.getwch()
-    if seq in ("[C", "[D"):  # VT 輸入模式下的方向鍵
-        return "right" if seq == "[C" else "left"
+    if seq in ("[A", "[B", "[C", "[D"):  # VT 輸入模式下的方向鍵
+        return {"[A": "up", "[B": "down", "[C": "right", "[D": "left"}[seq]
     if seq.startswith("[<") and seq.endswith("M"):  # 只看按下，放開是小寫 m
         b, x, y = map(int, seq[2:-1].split(";"))
         if b in (64, 65):  # 滾輪：上一頁／下一頁
@@ -1117,7 +1133,7 @@ def log_stderr():
 
 
 def main():
-    global paused
+    global paused, zoom, sel_sym
     # 從 Claude Code hook 啟動時環境帶著固定的 COLUMNS/LINES，rich 會照它畫、不看窗格真實大小
     os.environ.pop("COLUMNS", None)
     os.environ.pop("LINES", None)
@@ -1152,7 +1168,11 @@ def main():
             if Path(__file__).stat().st_mtime != code_at:
                 sys.exit(3)  # 程式碼改了：外層會用新版重跑，同一個窗格
             # -1：draw() 底部留一行。每圈重算，拖拉窗格高度會自動重新分頁
-            names = views_for(console.height - 1, console.width)
+            # 右側 K 線面板吃掉的寬度要先扣掉，表格才知道自己能用多少
+            panel_w = min(KPANEL_MAX, console.width - COL_W - 2)
+            if panel_w < KPANEL_MIN:
+                panel_w = 0  # 窗格太窄就整個收起來，只留表格
+            names = views_for(console.height - 1, console.width - panel_w)
             idx %= len(names)
             key, pending = pending or read_key(), None
             new = (idx + 1) % len(names) if not paused and time.time() - shown >= AUTO_SEC else idx
@@ -1164,6 +1184,17 @@ def main():
             elif isinstance(key, tuple) and (market := clicked_market(*key[1:])):
                 own = [i for i, v in enumerate(names) if v[0] == market]
                 new = own[(own.index(idx) + 1) % len(own)] if idx in own else own[0]  # 再點同一個頁籤就翻它的下一子頁
+            elif isinstance(key, tuple) and (pick := clicked_row(*key[1:], names[idx][1],
+                                                              console.width - panel_w)):
+                sel_sym = pick  # 點個股那一列就換右邊面板顯示的標的
+            elif key == "up":
+                move_sel(names[idx][1], -1)
+            elif key == "down":
+                move_sel(names[idx][1], 1)
+            elif key in ("+", "="):  # = 跟 + 同一顆鍵，不用按 shift
+                zoom = (zoom + 1) % len(ZOOMS)
+            elif key == "-":
+                zoom = (zoom - 1) % len(ZOOMS)
             elif key == "right":
                 new = (idx + 1) % len(names)
             elif key == "left":
@@ -1175,13 +1206,13 @@ def main():
                 old_rows, idx = rows_of(names[idx][1], names[idx][0] == "庫存"), new
                 t0 = time.time()
                 while (t := time.time() - t0) < FLIP_SEC:
-                    draw(console, render(names[idx], old_rows, t))
+                    draw(console, render(names[idx], old_rows, t, panel_w, console.height - 1))
                     time.sleep(1 / 30)
                     if pending := read_key():  # 翻牌中又點了別頁：不等動畫跑完，直接換
                         break
                 shown = time.time()
             if not pending:
-                draw(console, render(names[idx]))
+                draw(console, render(names[idx], panel_w=panel_w, height=console.height - 1))
                 time.sleep(FRAME_SEC - time.time() % FRAME_SEC)  # 睡到下一個幀邊界，跑馬燈才勻速
     finally:
         console.file.write("\x1b[?25h\x1b[?1000l\x1b[?1006l")  # q 離開時把游標、滑鼠還回來

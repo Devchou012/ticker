@@ -51,7 +51,49 @@ def demo():
     m.alert_msgs[:] = [(time.time() - m.ALERT_SEC - 1, "舊訊息")]
     m.check_alerts()
     assert not m.alert_msgs, "超過 ALERT_SEC 要自己消失"
-    print("位階／籌碼／類股／警示 ok")
+
+    # K 線：根數隨縮放變、圖的寬高固定、顏色看站在哪條均線上
+    m.bars.clear()
+    m.bars["AAA"] = [[10 + i * 0.1, 11 + i * 0.1, 9 + i * 0.1, 10.5 + i * 0.1] for i in range(90)]
+    m.zoom = 0
+    g, st, n = m.kline("AAA", 40, 10)
+    assert n == 20, f"每根 2 格、40 格寬應該畫 20 根，畫了 {n}"
+    assert len(g) == 10 and all(len(r) == 40 for r in g), "圖的行數與每行寬度要固定"
+    m.zoom = 1
+    assert m.kline("AAA", 40, 10)[2] == 40, "×1 時 40 格畫 40 根"
+    m.zoom = 2
+    assert m.kline("AAA", 40, 10)[2] == 13, "×3 時 40 格畫 13 根"
+    m.zoom = 0
+    assert m.kline("NOPE", 40, 10) == ([], [], 0), "沒資料回空的"
+    assert m.kline("AAA", 40, 2) == ([], [], 0), "行數太少畫不了"
+    used = {s for row in st for s in row if s}
+    assert used == {m.BAR_UP}, f"一路上漲的資料每根都該站上均線，拿到 {used}"
+    m.bars["BBB"] = [[20 - i * 0.1, 21 - i * 0.1, 19 - i * 0.1, 20.5 - i * 0.1] for i in range(90)]
+    used = {s for row in m.kline("BBB", 40, 10)[1] for s in row if s}
+    assert used == {m.BAR_DOWN}, f"一路下跌的每根都該跌破月線，拿到 {used}"
+
+    # 選取：換頁時自動落在這一頁的第一檔，上下鍵繞一圈
+    items = [("AAA", "甲"), ("BBB", "乙"), ("CCC", "丙")]
+    m.sel_sym = "ZZZ"
+    m.sel_items(items)
+    assert m.sel_sym == "AAA", "不在這一頁就選第一檔"
+    m.move_sel(items, 1)
+    assert m.sel_sym == "BBB"
+    m.move_sel(items, -1)
+    m.move_sel(items, -1)
+    assert m.sel_sym == "CCC", "往上越界要繞到最後一檔"
+    m.sel_items([])
+    assert m.sel_sym is None, "空頁面沒有東西可選"
+
+    # 點列：從畫面文字反查代號，兩欄並排時取水平位置最近的那個
+    m.screen[:] = ["", " 甲  AAA   ...   乙  BBB "]
+    assert m.clicked_row(3, 2, items) == "AAA"
+    assert m.clicked_row(24, 2, items) == "BBB"
+    assert m.clicked_row(3, 99, items) is None, "點到畫面外不算"
+    assert m.clicked_row(3, 1, items) is None, "那一行沒有代號"
+    assert m.clicked_row(24, 2, items, limit=10) is None, "點在表格右界外（K 線圖上）不改選股"
+
+    print("位階／籌碼／類股／警示／K線／選取 ok")
 
 
 if __name__ == "__main__":
