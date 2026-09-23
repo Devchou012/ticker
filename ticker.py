@@ -150,10 +150,13 @@ def load_portfolio():
     pages = {**({"庫存": [(h["symbol"], h["name"]) for h in my["庫存"]]} if my.get("庫存") else {}),
              **({"觀察": [(w["symbol"], w["name"]) for w in my["觀察"]]} if my.get("觀察") else {}),
              **BASE_PAGES}
-    return hold, pages
+    return hold, pages, my.get("警示", [])
 
 
-HOLD, PAGES = load_portfolio()
+SECTORS = []          # BASE_PAGES["類股"] 就是這個 list，抓到之後原地依漲幅排序
+BASE_PAGES["類股"] = SECTORS
+
+HOLD, PAGES, ALERTS = load_portfolio()
 REFRESH_SEC, IDLE_SEC = 15, 60  # 盤中／盤後輪詢間隔；ponytail: Yahoo 輪詢，要逐筆就換富果/Shioaji WebSocket
 UP, DOWN = "bold #ff3b3b", "bold #00e676"  # 台灣習慣紅漲綠跌，美式就對調
 FLAT, NAME, SYMBOL, HEADER, TAB = "#b0b0b0", "bold #ffffff", "#8a8a8a", "bold #4dd0ff", "bold #000000 on #4dd0ff"
@@ -182,8 +185,38 @@ MARQUEE_FIXED = [("DX-Y.NYB", "DXY"), ("BZ=F", "Brent"), ("GC=F", "Gold"),
 AUTO_SEC = 20             # 自動翻頁間隔；手動切頁會重新計時
 TAB_GAP = " " * 4          # 頁籤之間的空白
 INDEX_SWAP_SEC = 4        # 大盤第二行在幅度 / 漲跌點數之間輪流切換的秒數
+# 位階：現價對 20 日均線的乖離率，加 52 週位置。日線一天抓一次，寫成檔案，重開面板不用重抓
+DAILY_FILE = Path(__file__).with_name("daily.json")
+DEV_HIGH, DEV_LOW = 0.08, -0.08       # 乖離率超過 ±8% 就標追高／回檔
+DEV_HOT = "bold #000000 on #ff8f00"   # 追高用橘底，跟爆量的黃底、漲跌的紅綠都分得開
+DEV_COLD = "bold #000000 on #26c6da"  # 回檔用青底
+POS_HOT, POS_COLD = 90, 10            # 52 週位置的高低帶，超過就上色
+# 籌碼：外資買賣超連續天數。證交所 T86 收盤後才更新，一小時抓一次就夠
+DAILY_BATCH, DAILY_GAP = 25, 2.0   # 日線分批下載的批量與批間隔，一次全丟會被擋
+CHIP_FILE = Path(__file__).with_name("chips.json")
+# ponytail: chips.json 存全市場（約 230KB），不是只存名單內的。觀察清單隨時會加新股，
+# 只存名單內的話新加的那檔就沒有歷史可以算連續天數。嫌大再改成按名單裁切
+CHIP_DAYS = 12        # 往回看幾個交易日算連續天數
+CHIP_SEC = 3600
+# openapi.twse.com.tw 的 /v1/fund/T86 會回 HTML，只有 rwd 這條是 JSON
+T86_URL = "https://www.twse.com.tw/rwd/zh/fund/T86?date={}&selectType=ALLBUT0999&response=json"
+# 類股輪動：證交所 MIS 的類股指數，跟個股走同一條連線，盤中即時。名稱用回傳的 n，不寫死
+SECTOR_CODES = [f"t{n:02d}" for n in range(1, 32)]
+SECTOR_SET = {f"{c}.TW" for c in SECTOR_CODES}  # 這些只走 MIS，不進 yfinance，也沒有分時圖
+# 警示：到價與爆量。規則放 portfolio.json 的「警示」，每天每條只響一次
+ALERT_SEC = 300       # 訊息在跑馬燈上留多久
+VOL_ALERT = 3.0       # 量比超過這個倍數就自動報一次
+ALERT_STYLE = "bold #000000 on #ff3b3b"
 
 quotes = {}  # symbol -> (price, prev_close)
+daily = {}        # symbol -> (ma20, ma60, low52, high52)
+daily_date = ""   # 日線統計是哪一天抓的
+daily_busy = False  # 背景在抓日線時不要再開一條
+chips = {}        # 日期 -> {證券代號: 外資買賣超張數}
+chips_at = 0.0
+alert_msgs = []   # [(觸發時間, 文字)]，跑馬燈左邊插播
+alert_fired = {}  # 規則 -> 觸發日期，同一天只響一次
+bell = False      # 有新警示就讓 draw() 響一聲
 last_update = 0.0
 paused = False  # 空白鍵暫停自動翻頁，想盯著某一頁看的時候用
 
@@ -291,6 +324,8 @@ def fetch_rate(sym):
 
 
 def fetch(sym):
+    if sym in SECTOR_SET:
+        return  # 類股指數只有 MIS 有，交給 fetch_twse
     if sym in RATES:
         try:
             fetch_rate(sym)
@@ -406,7 +441,21 @@ def poller():
                 fetch_twse(syms)
             except Exception:
                 pass  # 證交所連不上就先用 Yahoo 的延遲價
+            try:
+                fetch_sectors()
+            except Exception:
+                pass  # 類股指數抓不到就先空著
+            # 位階是日線統計，盤中不急；盤中抓會跟即時報價搶 Yahoo 的額度（YFRateLimitError），
+            # 所以只在盤後補，除非手上完全沒資料（第一次開面板）
+            if daily_date != time.strftime("%Y%m%d") and not daily_busy and (not market_hours() or not daily):
+                threading.Thread(target=daily_worker, daemon=True).start()
+            if time.time() - chips_at >= CHIP_SEC:
+                try:
+                    fetch_chips()
+                except Exception:
+                    pass
             mark_ticks()
+            check_alerts()
             last_update = time.time()
             time.sleep(REFRESH_SEC if market_hours() else IDLE_SEC)
 
@@ -414,6 +463,7 @@ def poller():
 SPARK_ROWS = 2  # 走勢圖幾行高，每檔個股也跟著佔這麼多行
 RANGE_W = 16  # 走勢欄寬度（字數）：區間條與分時走勢共用，換顯示不會改版面
 SPARK_SWAP_SEC = 5   # 區間條 / 分時走勢輪流切換的秒數
+HEAT_FULL = 0.02     # 類股強弱條滿格的漲跌幅；類股指數一天動 2% 已經是很大的輪動
 INTRADAY_SEC = 60    # 分時資料重抓間隔
 intraday = {}        # symbol -> 收盤價（交易時段切成 RANGE_W*2 個時間點，未到的是 None）
 intraday_at = 0.0
@@ -423,7 +473,7 @@ live = {}            # symbol -> (日期, {時段格: 證交所即時價})，補
 def fetch_intraday():
     """當日分時走勢（江波圖）：5 分 K 收盤價，依時間落到固定的時段格子裡。"""
     global intraday_at
-    syms = sorted({s for rows in PAGES.values() for s, _ in rows if s not in FUTURES and s not in RATES})
+    syms = sorted({s for rows in PAGES.values() for s, _ in rows if s not in FUTURES and s not in RATES and s not in SECTOR_SET})
     data = yf.download(syms, period="1d", interval="5m", group_by="ticker",
                        threads=True, progress=False, auto_adjust=False)
     for sym in syms:
@@ -492,6 +542,13 @@ def spark(sym, price, prev):
     return "\n".join(lines), styles
 
 
+def heat_bar(pct):
+    """類股強弱條：中間是平盤，往右紅、往左綠，滿格是 HEAT_FULL。翻到類股頁一眼看出今天誰在領漲。"""
+    half = RANGE_W // 2
+    n = min(round(abs(pct) / HEAT_FULL * half), half)
+    return " " * half + "█" * n + " " * (half - n) if pct >= 0 else " " * (half - n) + "█" * n + " " * half
+
+
 def range_bar(price, low, high):
     """現價在今日低點到高點之間的位置，● 越靠右越接近今日高點。"""
     if not low or not high or high <= low:
@@ -500,32 +557,234 @@ def range_bar(price, low, high):
     return "─" * pos + "●" + "─" * (RANGE_W - 1 - pos)
 
 
+def load_daily():
+    """開面板時先讀上次存的日線統計：同一天抓過就不再抓，網路不通也還有位階可看。"""
+    global daily_date
+    try:
+        blob = json.loads(DAILY_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    daily.update({k: tuple(v) for k, v in blob.get("stats", {}).items()})
+    daily_date = blob.get("date", "")
+
+
+def daily_worker():
+    """位階的日線統計慢又容易被擋，丟背景跑，不要卡住即時報價那一圈。"""
+    global daily_busy
+    daily_busy = True
+    try:
+        fetch_daily()
+    except Exception:
+        pass  # 抓不到就沿用上次存的
+    finally:
+        daily_busy = False
+
+
+def fetch_daily():
+    """位階用的日線統計：20／60 日均線與 52 週高低。收盤後的值到隔天都不會變，一天抓一次。"""
+    global daily_date
+    daily_date = time.strftime("%Y%m%d")  # 先記日期：中途失敗也不要每圈重試，等明天
+    syms = sorted({s for rows in PAGES.values() for s, _ in rows
+                   if s not in FUTURES and s not in RATES and s not in SECTOR_SET})
+    # 一次丟一百多檔會被 Yahoo 擋（YFRateLimitError），連當輪的即時報價都一起掛掉。分批慢慢拿
+    for k in range(0, len(syms), DAILY_BATCH):
+        batch = syms[k:k + DAILY_BATCH]
+        try:
+            data = yf.download(batch, period="1y", interval="1d", group_by="ticker",
+                               threads=True, progress=False, auto_adjust=False)
+        except Exception:
+            continue  # 這批沒拿到就算了，明天再抓
+        for sym in batch:
+            try:
+                vals = [float(v) for v in data[sym]["Close"].dropna()]
+            except (KeyError, TypeError, ValueError):
+                continue
+            if len(vals) < 20:
+                continue  # 剛上市的沒有均線可算
+            ma60 = sum(vals[-60:]) / 60 if len(vals) >= 60 else None
+            daily[sym] = (sum(vals[-20:]) / 20, ma60, min(vals), max(vals))
+        time.sleep(DAILY_GAP)
+    try:
+        DAILY_FILE.write_text(json.dumps({"date": daily_date, "stats": daily}, ensure_ascii=False),
+                              encoding="utf-8")
+    except OSError:
+        pass
+
+
+
+def bias(sym, price):
+    """乖離率：現價離 20 日均線多遠。追高、回檔用底色標出來，中間帶維持灰字。"""
+    d = daily.get(sym)
+    if not d or not d[0]:
+        return "", ""
+    dev = (price - d[0]) / d[0]
+    return f"{dev:+.1%}", DEV_HOT if dev >= DEV_HIGH else DEV_COLD if dev <= DEV_LOW else SYMBOL
+
+
+def pos52(sym, price):
+    """52 週位置：0% 貼著一年低點，100% 創一年新高。"""
+    d = daily.get(sym)
+    if not d or d[3] is None or d[3] <= d[2]:
+        return "", ""
+    pct = min(max(round((price - d[2]) / (d[3] - d[2]) * 100), 0), 100)
+    return f"{pct}%", UP if pct >= POS_HOT else DOWN if pct <= POS_COLD else SYMBOL
+
+
+def load_chips():
+    try:
+        chips.update(json.loads(CHIP_FILE.read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        pass
+
+
+def fetch_chips():
+    """外資買賣超：證交所 T86 一天一份，只補 chips.json 還沒有的交易日。
+    收盤前當天還沒有資料，所以當天不寫空值，等下一輪再問。"""
+    global chips_at
+    chips_at = time.time()
+    ctx = ssl.create_default_context()
+    ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT  # 同 MIS：憑證缺 3.13 嚴格模式要的欄位
+    today, days, back = time.strftime("%Y%m%d"), [], 0
+    while len(days) < CHIP_DAYS and back < 30:
+        t = time.localtime(time.time() - back * 86400)
+        back += 1
+        if t.tm_wday < 5:
+            days.append(time.strftime("%Y%m%d", t))
+    for day in days:
+        if day in chips:
+            continue
+        try:
+            req = urllib.request.Request(T86_URL.format(day), headers={"User-Agent": "Mozilla/5.0"})
+            blob = json.load(urllib.request.urlopen(req, timeout=20, context=ctx))
+        except Exception:
+            continue  # 連不上就留著，下一輪再補
+        net = {}
+        if blob.get("stat") == "OK":
+            for r in blob.get("data", []):
+                try:  # 欄 4 外陸資、欄 7 外資自營商，兩者相加才是市場講的外資買賣超。股數換成張
+                    net[r[0].strip()] = (int(r[4].replace(",", "")) + int(r[7].replace(",", ""))) / 1000
+                except (IndexError, ValueError, AttributeError):
+                    pass
+        if net or day != today:
+            chips[day] = net  # 放假日存空的，下次就跳過；當天空的不存，收盤後才有
+    for day in list(chips):
+        if day not in days:
+            del chips[day]  # 只留最近這幾個交易日，檔案不會無限長
+    try:
+        CHIP_FILE.write_text(json.dumps(chips, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def chip_streak(sym):
+    """外資連續買超（正）或連續賣超（負）天數。T86 只有上市，上櫃與其他市場回空字串。"""
+    if not sym.endswith(".TW") or sym in SECTOR_SET:
+        return "", ""
+    code, sign, run = sym[:-3], 0, 0
+    for day in sorted(chips, reverse=True):
+        net = chips[day]
+        if not net:
+            continue  # 放假日沒有資料，不算中斷
+        v = net.get(code)
+        if not v:
+            break
+        way = 1 if v > 0 else -1
+        if sign and way != sign:
+            break
+        sign = way
+        run += 1
+    return (f"{sign * run:+d}日", UP if sign > 0 else DOWN) if run else ("", "")
+
+
+def pct_of(sym):
+    q = quotes.get(sym)
+    return (q[0] - q[1]) / q[1] if q and q[1] else 0.0
+
+
+def fetch_sectors():
+    """類股指數：MIS 的 tse_t01..t31，跟個股同一個介面，盤中即時。名稱用回傳的 n，不寫死。
+    每輪依今日漲幅重排，翻到這一頁最上面就是今天的主流類股。"""
+    if not SECTORS:
+        ctx = ssl.create_default_context()
+        ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
+        url = TWSE_MIS + "|".join(f"tse_{c}.tw" for c in SECTOR_CODES)
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        found = []
+        for r in json.load(urllib.request.urlopen(req, timeout=15, context=ctx)).get("msgArray", []):
+            name = (r.get("n") or "").removesuffix("指數").removesuffix("類")
+            if name and r.get("c"):
+                sym = f"{r['c']}.TW"
+                found.append((sym, name))
+                try:  # 盤前 z 是「-」，等 fetch_twse 下一輪用最佳買價補
+                    quotes[sym] = (float(r["z"]), float(r["y"]))
+                except (KeyError, ValueError):
+                    pass
+        SECTORS[:] = found  # 整批換掉，不用 append：render 那邊隨時可能在讀這個 list
+    SECTORS[:] = sorted(SECTORS, key=lambda s: -pct_of(s[0]))
+
+
+def check_alerts():
+    """到價與爆量。每條規則每天只響一次，訊息插在跑馬燈最左邊，順便響一聲。"""
+    global bell
+    today = time.strftime("%Y%m%d")
+    for rule in ALERTS:
+        q = quotes.get(rule.get("symbol"))
+        if not q or not q[1]:
+            continue
+        for way, label in (("above", "突破"), ("below", "跌破")):
+            level = rule.get(way)
+            key = f"{rule.get('symbol')}|{way}|{level}"
+            if level is None or alert_fired.get(key) == today:
+                continue
+            if q[0] >= level if way == "above" else q[0] <= level:
+                alert_fired[key] = today
+                alert_msgs.append((time.time(), f"{rule.get('name') or rule['symbol']} {label} {level:,.2f}"))
+                bell = True
+    for sym, name in [(s, n) for rows in PAGES.values() for s, n in rows]:
+        q, key = quotes.get(sym), f"{sym}|vol"
+        if not q or len(q) < 4 or alert_fired.get(key) == today:
+            continue
+        text, style = volume_ratio(sym, q[2], q[3])
+        if style == VOL_HOT_STYLE and text and float(text[:-1]) >= VOL_ALERT:
+            alert_fired[key] = today
+            alert_msgs.append((time.time(), f"{name} 爆量 {text}"))
+            bell = True
+    alert_msgs[:] = [m for m in alert_msgs if time.time() - m[0] < ALERT_SEC]
+
+
+
 def rows_of(items, hold=False):
     """hold=True 時漲跌欄改成今日損益（漲跌×股數），幅度欄改成總報酬（對成本）。"""
     out = []
     for sym, name in items:
         q = quotes.get(sym)
-        # 列格式：(名稱, 代號, 區間條, 量比, 價格, 漲跌, 幅度, 漲跌色, 量比色, 日線圖)
+        # 列格式：(名稱, 代號, 區間條, 量比, 價格, 漲跌, 幅度, 漲跌色, 量比色, 日線圖,
+        #        乖離, 乖離色, 52週位置, 位置色, 外資連續天數, 籌碼色)
         if not q or not q[1]:
-            out.append((name, sym, "", "", "…", "", "", None, "", ("", [])))
+            out.append((name, sym, "", "", "…", "", "", None, "", ("", []), "", "", "", "", "", ""))
             continue
         price, prev, *extra = q
         chg = price - prev
         vr, vr_style = volume_ratio(sym, *extra[:2]) if extra else ("", "")
         rb = range_bar(price, *extra[2:]) if extra else ""
+        if sym in SECTOR_SET:
+            rb = heat_bar(chg / prev)  # 類股沒有個股那種今日區間，這一欄改放強弱條
         sp = spark(sym, price, prev)
+        dev, dev_style = bias(sym, price)
+        pos, pos_style = pos52(sym, price)
+        chip, chip_style = chip_streak(sym)
         if hold:
             shares, cost = HOLD[sym]
             ret = (price - cost) / cost
             color = UP if ret > 0 else DOWN if ret < 0 else FLAT
-            out.append((name, sym, rb, vr, f"{price:,.2f}", f"{chg * shares:+,.0f}", f"{ret:+.2%}", color, vr_style, sp))
+            out.append((name, sym, rb, vr, f"{price:,.2f}", f"{chg * shares:+,.0f}", f"{ret:+.2%}", color, vr_style, sp, dev, dev_style, pos, pos_style, chip, chip_style))
             continue
         color = UP if chg > 0 else DOWN if chg < 0 else FLAT
-        out.append((name, sym, rb, vr, f"{price:,.2f}", f"{chg:+,.2f}", f"{chg / prev:+.2%}", color, vr_style, sp))
+        out.append((name, sym, rb, vr, f"{price:,.2f}", f"{chg:+,.2f}", f"{chg / prev:+.2%}", color, vr_style, sp, dev, dev_style, pos, pos_style, chip, chip_style))
     return out
 
 
-COL_W = 90  # 一欄個股表至少要這麼寬，視窗夠寬就並排多欄，一頁塞更多檔
+COL_W = 108  # 一欄個股表至少要這麼寬，視窗夠寬就並排多欄，一頁塞更多檔
 
 
 def views_for(height, width=COL_W):
@@ -534,7 +793,7 @@ def views_for(height, width=COL_W):
     per = rows * max(1, width // COL_W)
     out = []
     for market, items in PAGES.items():
-        chunks = [items[i:i + per] for i in range(0, len(items), per)]
+        chunks = [items[i:i + per] for i in range(0, len(items), per)] or [[]]
         for n, chunk in enumerate(chunks, 1):
             label = f"{market} {n}/{len(chunks)}" if len(chunks) > 1 else market
             out.append((market, chunk, label, rows))
@@ -566,14 +825,16 @@ def stock_table(hold, show_spark, new_rows, old_rows, t, span):
     table = Table(box=box.SIMPLE_HEAD, border_style=RULE, show_edge=False, expand=True, header_style=HEADER)
     # ratio 讓欄寬只看視窗寬度、不看內容，翻牌時才不會伸縮
     for col, just, ratio in (("名稱", "left", 3), ("代號", "left", 2),
-                             ("當日走勢" if show_spark else "今日區間", "center", 2), ("量比", "right", 1), ("價格", "right", 3),
+                             ("當日走勢" if show_spark else "今日區間", "center", 2), ("量比", "right", 1),
+                             ("乖離", "right", 1), ("52W", "right", 1), ("外資", "right", 1),
+                             ("價格", "right", 3),
                              ("今日損益" if hold else "漲跌", "right", 2), ("總報酬" if hold else "幅度", "right", 2)):
         table.add_column(Text(col, justify=just), justify=just, ratio=ratio, no_wrap=True)  # 標題跟內容同邊對齊
     table.columns[1].min_width = 11
-    for i, w in ((2, RANGE_W), (3, 5)):  # 區間條、量比固定寬度，ratio 欄會無視 min_width 把它們壓成「…」
+    for i, w in ((2, RANGE_W), (3, 5), (4, 7), (5, 5), (6, 5)):  # 區間條、量比、位階、籌碼固定寬度，ratio 欄會無視 min_width 把它們壓成「…」
         table.columns[i].ratio, table.columns[i].width = None, w
     for i in span:
-        blank = ("", "", "", "", "", "", "", None, "", ("", []))
+        blank = ("", "", "", "", "", "", "", None, "", ("", []), "", "", "", "", "", "")
         row = new_rows[i] if i < len(new_rows) else blank
         if show_spark and row[9][0]:
             bar = Text(row[9][0])
@@ -582,17 +843,24 @@ def stock_table(hold, show_spark, new_rows, old_rows, t, span):
                     at = k * (len(row[9][1]) + 1) + j
                     bar.stylize(style, at, at + 1)
         else:
-            bar = Text(row[2] + "\n" * (SPARK_ROWS - 1), RULE_BAR)  # 補空行，兩種顯示列高一樣
-            bar.highlight_words(["●"], row[7] or FLAT)
+            if row[1] in SECTOR_SET:
+                line = row[7] or RULE_BAR  # 類股強弱條整條都是色塊，不壓暗
+            else:
+                line = f"dim {row[7]}".replace("bold ", "") if row[7] else RULE_BAR  # 線用漲跌同色的暗版，● 才是亮的
+            bar = Text(row[2] + "\n" * (SPARK_ROWS - 1), line)  # 補空行，兩種顯示列高一樣
+            bar.highlight_words(["●"], f"not dim {row[7]}" if row[7] else FLAT)
         if old_rows is None:
             table.add_row(Text(row[0], NAME), Text(row[1], SYMBOL), bar, Text(row[3], row[8]),
+                          Text(row[10], row[11]), Text(row[12], row[13]), Text(row[14], row[15]),
                           Text(row[4], tick_style(row[1]) or row[7] or ""),
                           *(Text(c, row[7] or "") for c in row[5:7]))
             continue
         old = old_rows[i] if i < len(old_rows) else blank
         flips = [Text(solari(o, c, t, i * ROW_DELAY), FLIPPING) for o, c in zip(old[:7], row[:7])]
         flips[2] = bar  # 區間條是線條符號，不進字輪，直接換新
-        table.add_row(*flips)
+        # 位階、籌碼是每天才變一次的數字，不進字輪，跟區間條一樣直接換
+        extra = [Text(row[10], row[11]), Text(row[12], row[13]), Text(row[14], row[15])]
+        table.add_row(*flips[:4], *extra, *flips[4:])
     return table
 
 
@@ -637,12 +905,12 @@ def index_bar():
 
 def reload_if_changed(mtime):
     """portfolio.json 有變就重讀；新代號馬上抓一次，不用等下一輪輪詢。"""
-    global HOLD, PAGES
+    global HOLD, PAGES, ALERTS
     try:
         now = PORTFOLIO.stat().st_mtime if PORTFOLIO.exists() else 0
         if now == mtime:
             return mtime
-        HOLD, PAGES = load_portfolio()
+        HOLD, PAGES, ALERTS = load_portfolio()
     except (OSError, ValueError, KeyError):
         return mtime  # 檔案寫到一半或格式錯：保留舊名單，下圈再試
     new = [s for rows in PAGES.values() for s, _ in rows if s not in quotes]
@@ -709,7 +977,7 @@ def movers(n=MARQUEE_TOP):
     for items in PAGES.values():
         for sym, name in items:
             q = quotes.get(sym)
-            if sym in seen or sym in RATES or not q or not q[1]:
+            if sym in seen or sym in RATES or sym in SECTOR_SET or not q or not q[1]:
                 continue
             seen.add(sym)
             price, prev, *extra = q
@@ -731,6 +999,15 @@ def marquee_body():
         if hot:
             t.append(" ⚡", VOL_HOT_STYLE)
         t.append("   ")
+    return t
+
+
+def alert_text():
+    """警示插在跑馬燈最左邊，窄窗格沒有固定段時也照樣顯示。只留最近兩則，蓋掉整條就沒得看了。"""
+    t = Text()
+    for _, msg in alert_msgs[-2:]:
+        t.append(f" 警示 {msg} ", ALERT_STYLE)
+        t.append("  ")
     return t
 
 
@@ -773,7 +1050,9 @@ def clip_cells(t, start, width):
 
 def marquee(width):
     """組一整行：固定段 + 捲動段，總寬剛好 width。"""
-    head = marquee_head() if width >= MARQUEE_MIN else Text()
+    head = alert_text()
+    if width >= MARQUEE_MIN:
+        head.append_text(marquee_head())
     if head.plain:
         head.append("│ ", RULE)
     rest = width - cell_len(head.plain)
@@ -796,6 +1075,7 @@ screen = []  # 上一幀每一行的純文字，給 clicked_market 反查頁籤�
 def draw(console, renderable):
     """游標回左上角，整頁畫滿窗格（底部留一行），最後一行不換行，所以畫面不會捲動。
     不用 rich Live：alt screen 從 hook／重開窗格時偶爾整片空白；原地模式滿高時每次重畫都會往下捲。"""
+    global bell
     width, height = console.size
     height -= 1  # 底部留一行：每行都剛好滿寬，寫進右下角那一格終端機就捲一行（畫面上下抖動）
     buf = Console(file=io.StringIO(), width=width, height=height, force_terminal=True,
@@ -811,6 +1091,9 @@ def draw(console, renderable):
                        + "\r\n".join(line + "\x1b[0m\x1b[K" for line in lines)
                        + "\x1b[J\r\n" + bar.file.getvalue() + "\x1b[0m\x1b[K"
                        + "\x1b[?2026l")
+    if bell:
+        console.file.write(chr(7))  # 終端機響一聲，沒盯著面板也知道有警示
+        bell = False
     console.file.flush()
 
 
@@ -837,6 +1120,8 @@ def main():
             lock.bind(("127.0.0.1", 47653))
         except OSError:
             return  # 已經有面板在跑：exit 0，wt 會自動關掉這個窗格
+    load_daily()
+    load_chips()
     threading.Thread(target=poller, daemon=True).start()
     idx = 0
     if "--once" in sys.argv:  # 自我檢查：抓一輪、印出所有頁

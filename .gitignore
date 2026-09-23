@@ -1,3 +1,5 @@
 __pycache__/
 portfolio.json
 ticker-errors.log
+daily.json
+chips.json

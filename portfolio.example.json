@@ -6,5 +6,9 @@
   "觀察": [
     {"symbol": "2881.TW", "name": "富邦金"},
     {"symbol": "2542.TW", "name": "興富發"}
+  ],
+  "警示": [
+    {"symbol": "2330.TW", "name": "台積電", "above": 1300, "below": 1100},
+    {"symbol": "NVDA", "name": "NVIDIA", "above": 200}
   ]
 }
