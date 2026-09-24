@@ -9,6 +9,7 @@ import ssl
 import sys
 import threading
 import unicodedata
+import urllib.parse
 import urllib.request
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -146,10 +147,18 @@ PORTFOLIO = Path(__file__).with_name("portfolio.json")
 
 def load_portfolio():
     my = json.loads(PORTFOLIO.read_text(encoding="utf-8")) if PORTFOLIO.exists() else {}
-    hold = {h["symbol"]: (h["shares"], h["cost"]) for h in my.get("庫存", [])}
-    pages = {**({"庫存": [(h["symbol"], h["name"]) for h in my["庫存"]]} if my.get("庫存") else {}),
-             **({"觀察": [(w["symbol"], w["name"]) for w in my["觀察"]]} if my.get("觀察") else {}),
-             **BASE_PAGES}
+    holdings = my.get("庫存", [])
+    if isinstance(holdings, dict):
+        holdings = [x for items in holdings.values() for x in items]
+    hold = {h["symbol"]: (h["shares"], h["cost"]) for h in holdings}
+    # 分頁名隨 portfolio.json，照檔案裡的順序排；只有「庫存」那頁額外顯示股數與損益。
+    # 一頁底下可再用 {"產業": [...]} 分組，同產業排在一起，分組名當成一列標題。
+    def entries(v):
+        if isinstance(v, dict):
+            return [x for group, items in v.items() for x in [(None, group)] + entries(items)]
+        return [(x["symbol"], x["name"]) for x in v]
+
+    pages = {**{k: entries(v) for k, v in my.items() if v and k != "警示"}, **BASE_PAGES}
     return hold, pages, my.get("警示", [])
 
 
@@ -165,6 +174,12 @@ UP, DOWN = "bold #ff3b3b", "bold #00e676"  # 台灣習慣紅漲綠跌，美式�
 FLAT, NAME, SYMBOL, HEADER, TAB = "#b0b0b0", "bold #ffffff", "#8a8a8a", "bold #4dd0ff", "bold #000000 on #4dd0ff"
 RULE = "#3a3a3a"  # 表頭下方細線顏色
 RULE_BAR = "#4a4a4a"  # 今日區間條的線
+# 今日區間條風格：grad 漸層填色（預設，帶量價對比）/ dash 線加 ● / track 點線 / fill 實心
+# / light 細底線 / tick 兩端界線
+RANGE_STYLE = "grad"
+# grad 的量價配色：爆量用亮色，量縮轉暗，價方向決定紅綠
+HOT_OF = {"bold #ff3b3b": "#ff1744", "bold #00e676": "#00ff88"}
+DIM_OF = {"bold #ff3b3b": "#7a2020", "bold #00e676": "#1a6640", "#b0b0b0": "#4a4a4a"}
 VOL_HOT_STYLE, VOL_LOW_STYLE = "bold #000000 on #ffd54f", "#555555"  # 爆量用反白黃底，跟紅綠、翻牌字都分得開
 TICK_UP, TICK_DOWN = "bold #000000 on #ff3b3b", "bold #000000 on #00e676"  # 價格跳動時整格亮一下，顏色跟漲跌一致
 TICK_SEC = 0.8  # 亮燈持續秒數；主迴圈 20fps 重繪，這段時間內都看得到
@@ -221,6 +236,8 @@ daily_busy = False  # 背景在抓日線時不要再開一條
 miss_at = 0.0       # 上次補抓缺漏日線的時間
 MISS_RETRY = 600    # 缺日線的個股多久補抓一次；只抓缺的那幾檔，盤中也不怕被限流
 bars = {}         # symbol -> [[開, 高, 低, 收], ...]，最近 KBARS 根，給 K 線面板用
+bar_day = {}      # symbol -> bars 最後一根的日期（YYYYMMDD）
+live_bar = {}     # symbol -> (交易日, 開, 高, 低, 收)：盤中用即時報價組出今天那根，Yahoo 日線要收盤後才有
 chips = {}        # 日期 -> {證券代號: 外資買賣超張數}
 chips_at = 0.0
 alert_msgs = []   # [(觸發時間, 文字)]，跑馬燈左邊插播
@@ -279,10 +296,64 @@ def fetch_twse(syms):
                 prev = float(r["y"])
             except (KeyError, ValueError, AttributeError):
                 continue
+            if time.time() - fugle_at.get(sym, 0) < FUGLE_FRESH:
+                continue  # 富果逐筆比 MIS 快照新，別用舊的蓋回去
             old = quotes.get(sym, ())
             avg = old[3] if len(old) > 3 else None
             vol = float(r["v"]) * 1000 if r.get("v") else None  # MIS 成交量單位是張
             quotes[sym] = (price, prev, vol, avg, float(r["l"]), float(r["h"]))
+            if r.get("o", "-") != "-" and r.get("d"):  # 開盤前還沒有開盤價，今天那根先不畫
+                live_bar[sym] = (r["d"], float(r["o"]), float(r["h"]), float(r["l"]), price)
+
+
+CNBC_URL = ("https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol?symbols={}"
+            "&requestMethod=itv&noform=1&partnerId=2&fund=1&exthrs=1&output=json&events=1")
+# Yahoo 限流時的備援來源。CNBC 自己一套代號，對得上的才補，對不上的（韓股、鋁、上櫃）就等 Yahoo 回來
+CNBC_SYM = {"^N225": ".N225", "^HSI": ".HSI", "^GDAXI": ".GDAXI", "^VIX": ".VIX", "^DJT": ".DJT",
+            "^SKEW": ".SKEWX", "^IRX": "US3M", "^TNX": "US10Y", "^TYX": "US30Y", "DX-Y.NYB": ".DXY",
+            "^GSPC": ".SPX", "^IXIC": ".IXIC", "^DJI": ".DJI", "^SOX": ".SOX",
+            "EURUSD=X": "EUR=", "CNY=X": "CNY=", "TWD=X": "TWD=", "JPY=X": "JPY=", "KRW=X": "KRW=",
+            "GC=F": "@GC.1", "SI=F": "@SI.1", "HG=F": "@HG.1", "CL=F": "@CL.1", "BZ=F": "@LCO.1",
+            "NG=F": "@NG.1", "BTC-USD": "BTC.CM="}
+
+
+def cnbc_sym(sym):
+    if sym in CNBC_SYM:
+        return CNBC_SYM[sym]
+    if sym.endswith(".T"):
+        return f"{sym[:-2]}.JP"
+    # 台股不走 CNBC：它給的昨收等於最後價，會變成永遠 0%；同一輪的 fetch_twse 才是正解
+    return sym if sym.replace(".", "").isalnum() and not sym.endswith((".TW", ".TWO", ".KS")) else None
+
+
+def num(text):
+    return float(str(text).replace(",", "").rstrip("%"))
+
+
+def fetch_cnbc(syms):
+    """Yahoo 被限流時的備援：CNBC 一次吃一整批代號，欄位剛好對得上（價、昨收、量、高低）。
+    日線均量它沒有，量比就先空著，Yahoo 回來那輪會補上。"""
+    chans = {c: s for s in syms if (c := cnbc_sym(s))}
+    if not chans:
+        return
+    keys = list(chans)
+    for i in range(0, len(keys), 40):
+        url = CNBC_URL.format(urllib.parse.quote("|".join(keys[i:i + 40]), safe="|"))
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        rows = json.load(urllib.request.urlopen(req, timeout=15))["FormattedQuoteResult"]["FormattedQuote"]
+        for r in rows if isinstance(rows, list) else [rows]:
+            sym = chans.get(r.get("symbol"))
+            if not sym or r.get("last") is None or r.get("previous_day_closing") is None:
+                continue
+            try:
+                price, prev = num(r["last"]), num(r["previous_day_closing"])
+                low = num(r["low"]) if r.get("low") else 0
+                high = num(r["high"]) if r.get("high") else 0
+                if low <= 0 or high <= 0:  # 殖利率這類沒有日內高低，區間條就收成一點
+                    low = high = price
+            except ValueError:
+                continue
+            quotes[sym] = (price, prev, None, None, min(low, price), max(high, price))
 
 
 # 央行利率不是盤中報價：美國抓 FRED 的聯邦基金目標區間上限，日本、台灣抓 Trading Economics
@@ -416,11 +487,17 @@ def poller():
     global last_update, miss_at
     with ThreadPoolExecutor(8) as pool:
         while True:
-            syms = [s for rows in [INDICES, *PAGES.values()] for s, _ in rows]
+            syms = [s for rows in [INDICES, *PAGES.values()] for s, _ in rows if s]  # s 是 None 的是產業分組標題
             # 收盤的市場價格不會再動，跳過可以少掉夜裡大半的請求，免得被 Yahoo 限流。
             # 還沒抓到過的照抓，不然剛開面板時收盤市場會整片空白
             syms = [s for s in syms if s not in FUTURES and (s in RATES or session_open(s) or s not in quotes)]
             list(pool.map(fetch, syms))  # 台股、台指期交給 tw_poller
+            missing = [s for s in syms if s not in quotes]  # 多半是 Yahoo 限流，整批空手而回
+            if missing:
+                try:
+                    fetch_cnbc(missing)
+                except Exception:
+                    pass  # 備援也連不上就維持空白，下輪再試
             try:
                 fetch_sectors()
             except Exception:
@@ -462,7 +539,7 @@ def tw_poller():
         if session_open("x.TW") or time.time() - twse_at >= IDLE_SEC:
             twse_at = time.time()
             try:
-                fetch_twse([s for rows in [INDICES, *PAGES.values()] for s, _ in rows])
+                fetch_twse([s for rows in [INDICES, *PAGES.values()] for s, _ in rows if s])
             except Exception:
                 pass  # 證交所連不上就先用 Yahoo 的延遲價
         for f in FUTURES:
@@ -485,11 +562,31 @@ def heat_bar(pct):
 
 
 def range_bar(price, low, high):
-    """現價在今日低點到高點之間的位置，● 越靠右越接近今日高點。"""
+    """現價在今日低點到高點之間的位置，越靠右越接近今日高點。風格看 RANGE_STYLE。"""
     if not low or not high or high <= low:
         return ""
     pos = round((min(max(price, low), high) - low) / (high - low) * (RANGE_W - 1))
-    return "─" * pos + "●" + "─" * (RANGE_W - 1 - pos)
+    if RANGE_STYLE == "grad":   # 填到現價，游標是 ▓，剩下 ░；顏色由 range_style() 補上量價對比
+        return "".join("█" if i < pos else "▓" if i == pos else "░" for i in range(RANGE_W))
+    if RANGE_STYLE == "track":
+        return "·" * pos + "◆" + "·" * (RANGE_W - 1 - pos)
+    if RANGE_STYLE == "fill":
+        return "█" * pos + "▌" + " " * (RANGE_W - 1 - pos)
+    if RANGE_STYLE == "light":
+        return "▁" * pos + "▄" + "▁" * (RANGE_W - 1 - pos)
+    if RANGE_STYLE == "tick":
+        return "".join("│" if i in (0, RANGE_W - 1) else "●" if i == pos else "┄" for i in range(RANGE_W))
+    return "─" * pos + "●" + "─" * (RANGE_W - 1 - pos)  # dash
+
+
+def range_style(color, vr_style):
+    """量價對比：色相看漲跌，明暗看量比。爆量加粗變亮、量縮轉暗，量價背離一眼看得出來。"""
+    color = color or FLAT
+    if vr_style == VOL_HOT_STYLE:
+        return f"bold {HOT_OF.get(color, color)}"
+    if vr_style == VOL_LOW_STYLE:
+        return DIM_OF.get(color, RULE_BAR)
+    return color
 
 
 def load_daily():
@@ -501,7 +598,9 @@ def load_daily():
         return
     daily.update({k: tuple(v) for k, v in blob.get("stats", {}).items()})
     bars.update(blob.get("bars", {}))
-    daily_date = blob.get("date", "")
+    bar_day.update(blob.get("bar_day", {}))
+    # 舊存檔沒記最後一根的日期，分不出 Yahoo 有沒有今天那根，當成沒抓過，收盤後重抓一次
+    daily_date = blob.get("date", "") if "bar_day" in blob else ""
 
 
 def daily_worker(syms=None):
@@ -517,9 +616,9 @@ def daily_worker(syms=None):
 
 
 def daily_syms():
-    """要抓日線的個股：清單裡扣掉期貨、匯率、類股指數。"""
+    """要抓日線的個股：清單裡扣掉期貨、匯率、類股指數，還有產業分組標題（代號是 None）。"""
     return sorted({s for rows in PAGES.values() for s, _ in rows
-                   if s not in FUTURES and s not in RATES and s not in SECTOR_SET})
+                   if s and s not in FUTURES and s not in RATES and s not in SECTOR_SET})
 
 
 def fetch_daily(syms=None):
@@ -550,9 +649,10 @@ def fetch_daily(syms=None):
                 daily[sym] = (sum(vals[-20:]) / 20, ma60, min(vals), max(vals))
             # K 線面板要的開高低收；只留最近 KBARS 根，畫得完的部分就夠了
             bars[sym] = [[round(float(x), 4) for x in row] for row in df.values[-KBARS:]]
+            bar_day[sym] = df.index[-1].strftime("%Y%m%d")
         time.sleep(DAILY_GAP)
     try:
-        DAILY_FILE.write_text(json.dumps({"date": daily_date, "stats": daily, "bars": bars},
+        DAILY_FILE.write_text(json.dumps({"date": daily_date, "stats": daily, "bars": bars, "bar_day": bar_day},
                                         ensure_ascii=False), encoding="utf-8")
     except OSError:
         pass
@@ -704,6 +804,9 @@ def rows_of(items, hold=False):
     """hold=True 時漲跌欄改成今日損益（漲跌×股數），幅度欄改成總報酬（對成本）。"""
     out = []
     for sym, name in items:
+        if sym is None:  # 分組標題列：只有名稱，沒有報價（名稱欄是純文字，不吃 markup，靠符號區隔）
+            out.append((f"▸ {name}", "", "", "", "", "", "", None, "", "", "", "", "", "", "", "", ""))
+            continue
         q = quotes.get(sym)
         # 列格式：(名稱, 代號, 區間條, 量比, 價格, 漲跌, 幅度, 漲跌色, 量比色,
         #        乖離, 乖離色, 52週位置, 位置色, 外資連續天數, 籌碼色, 型態, 型態色)
@@ -749,9 +852,78 @@ CELLS = {0: " ", 1: "╵", 2: "╷", 3: "│", 4: "▀", 5: "▀", 6: "▀", 7: 
 BITS = {" ": 0, "╵": 1, "╷": 2, "│": 3, "▀": 4, "▄": 8, "█": 12}
 
 
+FUGLE_FRESH = 10  # 富果多久沒推就讓 MIS 接手（秒）
+fugle_at = {}     # symbol -> 富果最後一次推送的時間
+
+
+def fugle_worker():
+    """選中的台股改用富果 WebSocket 逐筆更新：aggregates 頻道每筆成交推一次今天的開高低收。
+    沒設 FUGLE_API_KEY 就不跑，今天那根照樣用 MIS 每 5 秒組。
+    ponytail: 免費方案只能訂 5 檔，所以只訂 K 線面板選中的那一檔；升級付費方案才值得整份清單都訂。"""
+    key = os.environ.get("FUGLE_API_KEY")
+    if not key:  # 面板的上層視窗比 key 早開就不會帶這個變數，直接去讀使用者環境變數
+        try:
+            import winreg
+            key = winreg.QueryValueEx(winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment"), "FUGLE_API_KEY")[0]
+        except OSError:
+            return
+    import websocket  # 富果 SDK 帶進來的 websocket-client；SDK 自己的連線執行緒不是 daemon，會卡住面板結束，所以不用它連
+    from fugle_marketdata import WebSocketClient
+    state = {"ready": False, "sym": None, "ids": {}}  # ids: 富果代號 -> 訂閱 id，退訂要用 id
+
+    def on_open(ws):
+        state.update(ready=False, sym=None, ids={})  # 斷線重連後訂閱都沒了，重新來
+        ws.send(json.dumps({"event": "auth", "data": {"apikey": key}}))
+
+    def on_message(ws, raw):
+        m = json.loads(raw)
+        d, ev = m.get("data") or {}, m.get("event")
+        if ev == "authenticated":
+            state["ready"] = True
+        elif ev == "subscribed":
+            state["ids"][d.get("symbol")] = d.get("id")
+        elif ev in ("data", "snapshot") and m.get("channel") == "aggregates":
+            sym = state["sym"]
+            if not sym or d.get("symbol") != sym.split(".")[0] or not d.get("openPrice"):
+                return  # 退訂前的殘留訊息，或還沒開盤
+            last = d.get("lastPrice") or d.get("closePrice")
+            live_bar[sym] = (d["date"].replace("-", ""), d["openPrice"], d["highPrice"], d["lowPrice"], last)
+            q = quotes.get(sym)
+            if q:
+                quotes[sym] = (last, q[1], q[2], q[3] if len(q) > 3 else None, d["lowPrice"], d["highPrice"])
+            fugle_at[sym] = time.time()
+
+    ws = websocket.WebSocketApp(WebSocketClient(api_key=key).stock.url, on_open=on_open, on_message=on_message)
+    # reconnect：斷線後隔 60 秒再連；官方會擋短時間內大量重連的 IP
+    threading.Thread(target=lambda: ws.run_forever(ping_interval=30, reconnect=60), daemon=True).start()
+    while True:
+        want = sel_sym if sel_sym and sel_sym.endswith((".TW", ".TWO")) else None
+        if state["ready"] and want != state["sym"]:
+            try:
+                for code, sid in list(state["ids"].items()):
+                    ws.send(json.dumps({"event": "unsubscribe", "data": {"id": sid}}))
+                    state["ids"].pop(code, None)
+                state["sym"] = want
+                if want:
+                    ws.send(json.dumps({"event": "subscribe",
+                                        "data": {"channel": "aggregates", "symbol": want.split(".")[0]}}))
+            except Exception:
+                pass  # 連線剛好斷掉；重連後 on_open 會重設，下一圈再訂
+        time.sleep(0.5)
+
+
+def candles(sym):
+    """日 K 加上即時組出的今天那根：Yahoo 已經有今天就換掉，還沒有就接在後面。"""
+    data, lb = bars.get(sym), live_bar.get(sym)
+    if not data or not lb:
+        return data
+    day, *ohlc = lb
+    return data[:-1] + [ohlc] if bar_day.get(sym) == day else data + [ohlc]
+
+
 def kline(sym, width, rows):
     """K 線本體，回傳 (每列文字, 每列每格的樣式, 畫了幾根)。棒身佔 body 格、每根隔 step 格。"""
-    data = bars.get(sym)
+    data = candles(sym)
     step, body = ZOOMS[zoom]
     if not data or rows < 3 or width < step:
         return [], [], 0
@@ -843,8 +1015,9 @@ def kline_panel(width, rows):
             if s:
                 t.stylize(s, x + 1, x + 2)
         out.append(t)
-    closes = [b[3] for b in bars[sel_sym]]
-    view = bars[sel_sym][-n:] or bars[sel_sym]
+    data = candles(sel_sym)
+    closes = [b[3] for b in data]
+    view = data[-n:] or data
     ma = Text(" ")
     for label, k in (("MA5", 5), ("MA20", 20), ("MA60", 60)):
         if len(closes) >= k:
@@ -868,7 +1041,7 @@ def kline_panel(width, rows):
 def sel_items(items):
     """確保 sel_sym 落在這一頁裡；換頁或第一次進來就選第一檔。"""
     global sel_sym
-    syms = [s for s, _ in items]
+    syms = [s for s, _ in items if s]  # 產業分組標題不能被選
     if sel_sym not in syms:
         sel_sym = syms[0] if syms else None
     return syms
@@ -889,7 +1062,7 @@ def clicked_row(x, y, items, limit=None):
     if not 0 < y <= len(screen):
         return None
     line = screen[y - 1]
-    hits = [(s, cell_len(line[:line.index(s)]), cell_len(s)) for s, _ in items if s in line]
+    hits = [(s, cell_len(line[:line.index(s)]), cell_len(s)) for s, _ in items if s and s in line]
     return min(hits, key=lambda z: abs(z[1] + z[2] / 2 - x))[0] if hits else None
 
 
@@ -910,8 +1083,15 @@ def views_for(height, width=COL_W):
 def render(view, old_rows=None, t=1.0, panel_w=0, height=0):
     market, items, label, per_col = view
     sel_items(items)  # 換頁後 sel_sym 可能不在這一頁了
-    # 頁籤拉開、左右留白，滑鼠比較好點
-    tabs = TAB_GAP.join(f"[{TAB}]   {label}   [/]" if p == market else f"[{SYMBOL}]   {p}   [/]" for p in PAGES)
+    # 頁籤拉開、左右留白，滑鼠比較好點；分類一多會超寬被截掉，就一路縮到塞得下
+    for pad, gap in ((3, len(TAB_GAP)), (2, 2), (1, 1), (0, 1)):
+        labels = [label if p == market else p for p in PAGES]
+        plain = (" " * gap).join(" " * pad + x + " " * pad for x in labels)
+        if cell_len(plain) <= Console().width:
+            break
+    tabs = (" " * gap).join(
+        f"[{TAB}]{' ' * pad}{label}{' ' * pad}[/]" if p == market else f"[{SYMBOL}]{' ' * pad}{p}{' ' * pad}[/]"
+        for p in PAGES)
     age = int(time.time() - last_update) if last_update else "-"
     hold = market == "庫存"
     new_rows = rows_of(items, hold)
@@ -958,9 +1138,13 @@ def stock_table(hold, new_rows, old_rows, t, span):
         if row[1] in SECTOR_SET:
             line = row[7] or RULE_BAR  # 類股強弱條整條都是色塊，不壓暗
         else:
-            line = f"dim {row[7]}".replace("bold ", "") if row[7] else RULE_BAR  # 線用漲跌同色的暗版，● 才是亮的
+            line = RULE_BAR
         bar = Text(row[2], line)
-        bar.highlight_words(["●"], f"not dim {row[7]}" if row[7] else FLAT)
+        if RANGE_STYLE == "grad" and row[2] and row[1] not in SECTOR_SET:
+            end = row[2].find("▓")
+            bar.stylize(range_style(row[7], row[8]), 0, (end if end >= 0 else len(row[2])) + 1)
+        else:
+            bar.highlight_words(["●"], row[7] or FLAT)
         if old_rows is None:
             table.add_row(Text(" " + row[0], NAME), Text(row[1], SYMBOL), bar, Text(row[3], row[8]),
                           Text(row[9], row[10]), Text(row[11], row[12]), Text(row[13], row[14]),
@@ -1026,7 +1210,7 @@ def reload_if_changed(mtime):
         HOLD, PAGES, ALERTS = load_portfolio()
     except (OSError, ValueError, KeyError):
         return mtime  # 檔案寫到一半或格式錯：保留舊名單，下圈再試
-    new = [s for rows in PAGES.values() for s, _ in rows if s not in quotes]
+    new = [s for rows in PAGES.values() for s, _ in rows if s and s not in quotes]
     threading.Thread(target=lambda: [fetch(x) for x in new], daemon=True).start()
     return now
 
@@ -1237,6 +1421,7 @@ def main():
     load_chips()
     threading.Thread(target=poller, daemon=True).start()
     threading.Thread(target=tw_poller, daemon=True).start()
+    threading.Thread(target=fugle_worker, daemon=True).start()
     idx = 0
     if "--once" in sys.argv:  # 自我檢查：抓一輪、印出所有頁
         while not last_update:
