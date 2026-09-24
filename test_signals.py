@@ -93,7 +93,35 @@ def demo():
     assert m.clicked_row(3, 1, items) is None, "那一行沒有代號"
     assert m.clicked_row(24, 2, items, limit=10) is None, "點在表格右界外（K 線圖上）不改選股"
 
-    print("位階／籌碼／類股／警示／K線／選取 ok")
+    # 型態：均線排列、突破、K 棒
+    flat = [[100, 101, 99, 100]] * 59
+    m.bars["UPT"] = [[50 + i, 52 + i, 49.9 + i, 51.9 + i] for i in range(60)]
+    names = [p[0] for p in m.patterns("UPT")]
+    assert "多頭排列" in names, "一路漲要是多頭排列"
+    assert "突破月高" in names, "收在近 20 日高點之上"
+    m.bars["DOJI"] = flat[:-1] + [[100, 102, 98, 100.1]]
+    assert "十字線" in [p[0] for p in m.patterns("DOJI")], "開收幾乎同價"
+    m.bars["ENG"] = flat[:-1] + [[101, 101.5, 99.5, 100], [99.8, 102, 99.5, 101.2]]
+    assert "多頭吞噬" in [p[0] for p in m.patterns("ENG")], "紅 K 包住黑 K"
+    m.bars["HAM"] = flat + [[100.2, 100.6, 98, 100.5]]
+    assert "長下影線" in [p[0] for p in m.patterns("HAM")]
+    m.bars["SHORT"] = flat[:10]
+    assert m.patterns("SHORT") == [], "資料不夠不亂判"
+    assert all(len(m.patterns(k)) <= m.PAT_MAX for k in ("UPT", "ENG")), "最多 PAT_MAX 條"
+    m.quotes["UPT"] = (110.0, 109.0)
+    assert m.rows_of([("UPT", "漲")])[0][15] == m.patterns("UPT")[0][0], "表格型態欄放第一條"
+    assert m.rows_of([("SHORT", "短")])[0][15] == "", "沒報價的列型態留白"
+
+    # 台指期時段：日盤、夜盤跨午夜、週末
+    import time as _t
+    real = _t.localtime
+    for (wday, hh, mm), want in (((0, 9, 0), True), ((0, 14, 0), False), ((0, 20, 0), True),
+                                 ((1, 3, 0), True), ((0, 3, 0), False), ((5, 3, 0), True), ((6, 10, 0), False)):
+        m.time.localtime = lambda *a, w=wday, h=hh, mi=mm: _t.struct_time((2026, 9, 21, h, mi, 0, w, 264, 0))
+        assert m.futures_open() == want, (wday, hh, mm)
+    m.time.localtime = real
+
+    print("位階／籌碼／類股／警示／K線／型態／選取 ok")
 
 
 if __name__ == "__main__":
