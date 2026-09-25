@@ -104,17 +104,18 @@ def demo():
     n = sent(); m.draw(Con, frame("a", "X", "c"))
     assert "\x1b[2J" in Con.file.getvalue()[n:], "窗格大小變了整頁重畫"
 
-    # 買點燈：多頭拉回月線、收長下影線、量縮 → 閃；少任何一個條件就不閃
+    # 紅燈（買點）：半年線上揚、多頭拉回月線、收長下影線、量縮 → 閃；少任何一個條件就不閃
     m.live_bar.clear()
 
-    def setup(last_low_gap=0.001, quiet=True, hammer=True, slope=0.2):
-        closes = [100 + i * slope for i in range(130)]
+    def setup(last_low_gap=0.001, quiet=True, hammer=True, slope=0.2, head=0):
+        # 170 根：半年線要跟 20 個交易日前比，至少要 140 根；head 根 160 墊在前面，可以讓半年線下彎而季線照樣上揚
+        closes = [160.0] * head + [100 + i * slope for i in range(170 - head)]
         m.bars["BUY"] = [[c, c + 0.3, c - 0.3, c] for c in closes]
         m20 = sum(closes[-20:]) / 20
         low = m20 * (1 + last_low_gap)
         o, c = (m20 + 1.0, m20 + 1.2) if hammer else (m20 + 3, m20 + 1.2)
         m.bars["BUY"][-1] = [o, c + 0.05, low, c]
-        m.vols["BUY"] = [100.0] * 127 + ([40.0] * 3 if quiet else [300.0] * 3)
+        m.vols["BUY"] = [100.0] * 167 + ([40.0] * 3 if quiet else [300.0] * 3)
     setup()
     assert m.buy_signal("BUY")[1], "條件全部成立要閃"
     setup(quiet=False)
@@ -125,19 +126,25 @@ def demo():
     assert not m.buy_signal("BUY")[1], "沒拉回到均線附近不閃"
     setup(slope=-0.2)
     assert not m.buy_signal("BUY")[1], "季線下彎不閃"
-    # 半年線區間：現價在半年線下方 1%～5% 才亮橘燈
+    setup(head=60)
+    d = m.buy_detail("BUY")
+    assert d["rising"] and not d["ma120_up"] and not m.buy_signal("BUY")[1], "季線上揚但半年線下彎，不閃（回測後加的條件）"
+    m.bars["SHORT"] = m.bars["BUY"][-130:]
+    assert not m.buy_detail("SHORT")["ma120_up"], "不到 140 根算不出半年線斜率，不亮"
+    # 橘燈（弱勢提醒）：現價在半年線下方 1%～5% 才亮
     for ratio, want in ((0.97, True), (1.00, False), (0.995, False), (0.93, False), (1.07, False)):
         m.bars["Z"] = [[100.0] * 4 for _ in range(129)] + [[100.0 * ratio] * 4]  # 只拉開最後一根，半年線幾乎不動
         assert m.buy_signal("Z")[0] == want, f"現價約是半年線的 {ratio} 倍，區間燈應該 {want}"
     assert m.cell_len(m.buy_light("BUY").plain) == 5 and m.buy_light(None).plain == "", "兩顆燈、空列不畫"
-    # 閃燈：亮的那半拍兩顆都亮，暗的那半拍都熄成灰
+    # 燈號：紅燈（買點）閃爍；橘燈（弱勢提醒）恆亮不閃，免得被看成買點
     real_signal, real_time = m.buy_signal, m.time.time
     m.buy_signal = lambda sym: (True, True)
     lamps = lambda: [(t.plain[s.start:s.end], str(s.style)) for t in [m.buy_light("X")] for s in t.spans]
     m.time.time = lambda: m.FLASH_SEC * 10.5   # 偶數拍：亮
     assert m.buy_light("X").plain == f"{m.ZONE_ON} {m.FLOW_ON}" and not lamps(), "亮拍兩顆都亮，只有圓點、不塗底色"
-    m.time.time = lambda: m.FLASH_SEC * 11.5   # 奇數拍：熄
-    assert lamps() == [(m.LAMP_OFF, m.LAMP_OFF_STYLE)] * 2, "暗拍兩顆都熄成暗灰點"
+    m.time.time = lambda: m.FLASH_SEC * 11.5   # 奇數拍
+    assert m.buy_light("X").plain == f"{m.ZONE_ON} {m.LAMP_OFF}", "暗拍：橘燈照樣亮著，只有紅燈熄"
+    assert lamps() == [(m.LAMP_OFF, m.LAMP_OFF_STYLE)], "熄的紅燈是暗灰點"
     assert m.cell_len(m.LAMP_OFF) == m.cell_len(m.ZONE_ON) == 2, "亮暗寬度一樣，整欄不會跳"
     m.buy_signal, m.time.time = real_signal, real_time
     assert m.FLASH_SEC <= 0.25, "閃燈要比原本的 0.5 秒快"
@@ -222,13 +229,14 @@ def demo():
     # 閃燈原因：燈亮才有，寫出成立的是哪幾項
     setup()
     why = m.buy_reason("BUY")
-    assert why and why[0] == "買點" and "回測月線" in why[1] and "量縮" in why[1] and "長下影" in why[1], why
+    assert why and why[0] == "買點" and "半年線上揚" in why[1] and "回測月線" in why[1] and "量縮" in why[1]         and "長下影" in why[1], why
     setup(quiet=False)
     assert "量縮" not in (m.buy_reason("BUY") or ("", "", ""))[1], "紅燈沒亮不寫流程原因"
     m.bars["FLAT"] = [[100.0] * 4 for _ in range(130)]
     assert m.buy_reason("FLAT") is None, "兩顆燈都沒亮就沒有說明"
     m.bars["Z"] = [[100.0] * 4 for _ in range(129)] + [[97.0] * 4]
-    assert "半年線下 3.0%" in m.buy_reason("Z")[1], "橘燈寫出在半年線下方幾 %"
+    why = m.buy_reason("Z")
+    assert why[0] == "弱勢" and "跌破半年線 3.0%" in why[1], f"橘燈是弱勢提醒，寫出跌破幾 %：{why}"
 
     # 滑鼠序列分兩批到：要等後半段到齊，不能把 "52;12M" 當成按鍵
     class Keys:

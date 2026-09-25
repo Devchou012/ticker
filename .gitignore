@@ -4,3 +4,4 @@ ticker-errors.log
 daily.json
 chips.json
 flow.json
+backtest_cache.json

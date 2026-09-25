@@ -998,7 +998,7 @@ COLS = ((" 名稱", "left", NAME_W, 0),  # 名稱帶一格前導空白，不然�
         ("代號", "left", SYM_W, 0), ("今日區間", "center", RANGE_W, 5), ("量比", "center", 5, 6),
         ("乖離", "center", 7, 4), ("年區間", "center", 6, 2), ("外資", "center", 5, 3),
         ("價格", "center", PRICE_W, 0), ("漲跌", "center", CHG_W, 0), ("幅度", "center", PCT_W, 0),
-        ("型態", "center", 8, 1), ("買點", "center", 5, 0))
+        ("型態", "center", 8, 1), ("訊號", "center", 5, 0))
 
 
 def table_w(keep):
@@ -1187,7 +1187,10 @@ def vol_rows(sym, width, n):
     return ["".join(r) for r in grid], style
 
 
-ZONE_LO, ZONE_HI = 0.95, 0.99  # 現價是半年線的 95%～99%，也就是半年線下方 1%～5%：使用者自己設買點的區間
+# 弱勢提醒（橘燈）：現價是半年線的 95%～99%，也就是剛跌破半年線 1%～5%。
+# 原本是使用者自己的買點，回測（backtest.py，2021-09～2026-09、211 檔）這個位置買進 60 天後平均落後大盤 1.3%～8.7%，
+# 兩段期間都顯著（t 值 -8 以下），所以改成警訊：恆亮不閃，跟閃爍的紅燈買點分開
+ZONE_LO, ZONE_HI = 0.95, 0.99
 NEAR_MA = 0.02                 # 低點離月線／季線 2% 內算「拉回到均線附近」
 FLASH_SEC = 0.25               # 閃燈半週期：一秒亮暗各兩次
 # 燈用彩色 emoji 圓點：文字的 ● 只是字形上色，看起來空心；emoji 是整顆填滿的顏色。各佔兩格
@@ -1197,7 +1200,8 @@ ZONE_ON, FLOW_ON = "🟠", "🔴"
 LAMP_OFF, LAMP_OFF_STYLE = "● ", "#2a2e39"
 def buy_detail(sym):
     """買點的每個條件。用含今天即時那根的 K 線，盤中就會亮；量縮只看已收盤的量。資料不夠回 None。
-    簡單流程：季線上揚 → 拉回月線或季線附近又收回 → 量縮 → 止跌 K 棒（長下影、多頭吞噬）或站回月線。
+    紅燈（買點）：半年線上揚 → 季線上揚 → 拉回月線或季線附近又收回 → 量縮 → 止跌 K 棒（長下影、多頭吞噬）或站回月線。
+    「半年線上揚」是回測後加的（backtest.py 的 F3）：前四年、最近一年 60 天後都比原版好，但 t 值 1.3～1.5，證據不強。
     held、trigger 放的是成立的那一項名稱，K 線面板直接拿來當說明。"""
     data = candles(sym) or []
     if len(data) < 65:
@@ -1214,6 +1218,7 @@ def buy_detail(sym):
         "zone": gap is not None and ZONE_LO - 1 <= gap <= ZONE_HI - 1,
         "gap": gap,
         "rising": m60 > ma(60, 5),  # 季線比一週前高
+        "ma120_up": len(closes) >= 140 and ma(120) > ma(120, 20),  # 半年線比 20 個交易日前高；資料不夠就不亮
         "held": next((n for n, m in (("月線", m20), ("季線", m60))
                       if l <= m * (1 + NEAR_MA) and c >= m), ""),  # 碰到均線附近、收盤站得住
         "quiet": len(v) >= 20 and sum(v[-3:]) / 3 < sum(v[-20:]) / 20,  # 最近三天的量低於月均量
@@ -1225,35 +1230,34 @@ def buy_detail(sym):
 
 
 def buy_signal(sym):
-    """回傳 (在半年線區間, 簡單流程成立)。"""
+    """回傳 (弱勢提醒：剛跌破半年線, 買點：拉回流程成立)。"""
     d = buy_detail(sym)
     if not d:
         return False, False
-    return d["zone"], bool(d["rising"] and d["held"] and d["quiet"] and d["trigger"])
+    return d["zone"], bool(d["ma120_up"] and d["rising"] and d["held"] and d["quiet"] and d["trigger"])
 
 
 def buy_reason(sym):
     """K 線面板那一行：燈為什麼亮，格式跟型態說明一樣是 (標籤, 說明, 顏色)。沒亮回 None。"""
     d = buy_detail(sym)
     zone, flow_ok = buy_signal(sym)
-    parts = []
+    weak = f"跌破半年線 {abs(d['gap']):.1%}，回測顯示之後常落後大盤" if zone else ""
     if flow_ok:
-        parts.append(f"季線上揚・回測{d['held']}・量縮・{d['trigger']}")
-    if zone:
-        parts.append(f"半年線{'下' if d['gap'] < 0 else '上'} {abs(d['gap']):.1%}")
-    return ("買點", "｜".join(parts), UP if flow_ok else MA_LINES[2][2]) if parts else None
+        note = f"半年線上揚・季線上揚・回測{d['held']}・量縮・{d['trigger']}"
+        return "買點", note + (f"｜{weak}" if weak else ""), UP
+    return ("弱勢", weak, MA_LINES[2][2]) if zone else None
 
 
 def buy_light(sym):
-    """買點燈：左邊橘燈＝半年線區間（跟 K 線圖上的半年線同色），右邊紅燈＝簡單流程成立。兩顆都閃，同步。
-    暗的那半拍直接熄成跟沒亮一樣的灰，亮暗對比才夠，一眼掃得到。"""
+    """訊號燈：左邊橘燈＝弱勢提醒（剛跌破半年線，跟 K 線圖上的半年線同色），恆亮不閃；
+    右邊紅燈＝買點（拉回流程成立），閃爍。只有買點會閃，警訊不會被看成買點。"""
     t = Text()
     if not sym or sym in SECTOR_SET:
         return t
     zone, flow = buy_signal(sym)
     on = int(time.time() / FLASH_SEC) % 2 == 0
     # 亮燈只放 emoji 圓點本身，不塗底色：終端機一格只能塗方形，試過塗光暈都有方塊感
-    t.append(ZONE_ON if zone and on else LAMP_OFF, None if zone and on else LAMP_OFF_STYLE)
+    t.append(ZONE_ON if zone else LAMP_OFF, None if zone else LAMP_OFF_STYLE)  # 弱勢提醒恆亮，不閃
     t.append(" ")
     t.append(FLOW_ON if flow and on else LAMP_OFF, None if flow and on else LAMP_OFF_STYLE)
     return t
