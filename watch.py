@@ -2,8 +2,11 @@
 
 Usage:
   python watch.py 興富發 2881 NVDA   add (Taiwan stock name or code, or a US ticker)
-  python watch.py -d 興富發           remove
+  python watch.py -g 半導體 2303      add into a group (default group: 台股／美股／日韓, same as the web page)
+  python watch.py -d 興富發           remove (a group left empty is removed too)
   python watch.py                     list
+
+The watchlist is either a flat list or {"group": [...]} (groups may nest); both work.
 """
 import json
 import ssl
@@ -14,6 +17,7 @@ from pathlib import Path
 import yfinance as yf
 
 PORTFOLIO = Path(__file__).with_name("portfolio.json")
+MARKET_OF = {".TW": "台股", ".TWO": "台股", ".T": "日韓", ".KS": "日韓", ".KQ": "日韓"}  # same default groups as the web page
 SOURCES = [  # (url, code field, name field, Yahoo suffix)
     ("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", "Code", "Name", ".TW"),
     ("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes",
@@ -52,35 +56,61 @@ def resolve(query, listing):
     return None
 
 
+def lists(watch, group=""):
+    """Yield (group, list) for every list in the watchlist, flat or grouped."""
+    if isinstance(watch, list):
+        yield group, watch
+    else:
+        for g, v in watch.items():
+            yield from lists(v, g)
+
+
+def prune(watch):
+    """Drop groups left empty; the panel would show an empty group header otherwise."""
+    if isinstance(watch, dict):
+        for g in [g for g, v in watch.items() if not prune(v)]:
+            del watch[g]
+    return watch
+
+
 def main():
     args = sys.argv[1:]
     data = json.loads(PORTFOLIO.read_text(encoding="utf-8")) if PORTFOLIO.exists() else {}
-    watch = data.setdefault("觀察", [])
+    watch = data.setdefault("觀察", {})
     if not args:
-        for w in watch:
-            print(f"{w['symbol']:<12}{w['name']}")
+        for g, items in lists(watch):
+            if g:
+                print(f"▸ {g}")
+            for w in items:
+                print(f"{'  ' if g else ''}{w['symbol']:<12}{w['name']}")
         return
     remove = args[0] == "-d"
-    queries = args[1:] if remove else args
+    group = args[1] if args[0] == "-g" and len(args) > 1 else None
+    queries = args[1:] if remove else args[2:] if group else args
     listing = tw_listing()
     for q in queries:
         if remove:
-            before = len(watch)
-            watch[:] = [w for w in watch if q not in (w["symbol"], w["name"], w["symbol"].split(".")[0])]
-            print(f"Removed {q}" if len(watch) < before else f"Not on the list: {q}")
+            gone = 0
+            for _, items in lists(watch):
+                before = len(items)
+                items[:] = [w for w in items if q not in (w["symbol"], w["name"], w["symbol"].split(".")[0])]
+                gone += before - len(items)
+            print(f"Removed {q}" if gone else f"Not on the list: {q}")
             continue
         hit = resolve(q, listing)
         if not hit:
             continue
-        if any(w["symbol"] == hit[0] for w in watch):
-            print(f"Already on the list: {hit[1]} {hit[0]}")
+        where = next((g for g, items in lists(watch) for w in items if w["symbol"] == hit[0]), None)
+        if where is not None:
+            print(f"Already on the list: {hit[1]} {hit[0]}" + (f" ({where})" if where else ""))
             continue
-        watch.append({"symbol": hit[0], "name": hit[1]})
-        print(f"Added {hit[1]} {hit[0]}")
+        g = group or MARKET_OF.get("." + hit[0].split(".")[-1], "美股")  # NVDA → ".NVDA" isn't a suffix → 美股
+        (watch.setdefault(g, []) if isinstance(watch, dict) else watch).append({"symbol": hit[0], "name": hit[1]})
+        print(f"Added {hit[1]} {hit[0]}" + (f" ({g})" if isinstance(watch, dict) else ""))
+    prune(watch)
     tmp = PORTFOLIO.with_suffix(".tmp")  # write to a temp file, then swap it in, so the panel never reads a half-written file
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(PORTFOLIO)
-
 
 if __name__ == "__main__":
     main()

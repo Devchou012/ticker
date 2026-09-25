@@ -115,7 +115,8 @@ key 存成使用者環境變數 `FUGLE_API_KEY`，輸入時只顯示 `*`，不�
 
 ```
 python watch.py 興富發 2881 NVDA   # 加入觀察（台股名稱或代號、美股代號）
-python watch.py -d 興富發           # 移除
+python watch.py -g 半導體 2303      # 加進指定分組（沒指定就依市場放進台股／美股／日韓，跟網頁版一樣）
+python watch.py -d 興富發           # 移除（分組空了一起刪）
 python watch.py                     # 列出
 ```
 
@@ -202,6 +203,7 @@ python watch.py                     # 列出
 ## 變更紀錄
 
 **2026-09-26**
+- 修正：`watch.py` 遇到分組的觀察名單（`{"產業": [...]}`）會直接出錯；現在分組、扁平兩種都能列出、加入、移除，`-g` 指定分組。
 - GitHub Actions：每次 push、PR 在 Windows 跑靜態檢查（flake8 錯誤類）與全部自我檢查，測試不連網。
 - 拆成三層：`market.py`（資料）、`signals.py`（判斷，回傳語意）、`ticker.py`（畫面）。行為不變：回測 22 萬個交易日結果完全相同，新舊網頁 API 逐列比對一致。
 - 發現：Yahoo 逐檔查價（`fast_info`）的昨收會錯（例如 NVDA 223.82，實際 224.58），改成批次查價後的昨收跟日 K 一致，美股、日股的漲跌幅因此變準。
