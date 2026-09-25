@@ -1,5 +1,5 @@
 """欄位收合、過期變暗、底色收斂的自我檢查。不連網。"""
-import importlib.util, sys, time
+import importlib.util, re, sys, time
 
 spec = importlib.util.spec_from_file_location("t", "ticker.py")
 m = importlib.util.module_from_spec(spec); sys.modules["t"] = m
@@ -95,13 +95,14 @@ def demo():
     m.draw(Con, frame("a", "b", "c")); first = sent()
     m.draw(Con, frame("a", "b", "c")); same = sent() - first
     m.draw(Con, frame("a", "X", "c"))
-    assert "[2J" in Con.file.getvalue()[:first], "第一幀整頁重畫"
-    assert "b" not in Con.file.getvalue()[first:first + same].replace("[", ""), "沒變的行不重送"
-    assert "[2;1HX" in Con.file.getvalue()[first + same:], "變的那行要送、而且送到第 2 行"
-    assert "a" not in Con.file.getvalue()[first + same:].split("[6;1H")[0].replace("[", ""), "只送變的那行"
+    assert "\x1b[2J" in Con.file.getvalue()[:first], "第一幀整頁重畫"
+    assert "b" not in Con.file.getvalue()[first:first + same].replace("\x1b[", ""), "沒變的行不重送"
+    seg = Con.file.getvalue()[first + same:]
+    assert re.search(r"\x1b\[2;1H(\x1b\[[0-9;]*m)*X", seg), "變的那行要送、而且送到第 2 行"
+    assert "a" not in Con.file.getvalue()[first + same:].split("\x1b[6;1H")[0].replace("\x1b[", ""), "只送變的那行"
     Con.size = (50, 6)
     n = sent(); m.draw(Con, frame("a", "X", "c"))
-    assert "[2J" in Con.file.getvalue()[n:], "窗格大小變了整頁重畫"
+    assert "\x1b[2J" in Con.file.getvalue()[n:], "窗格大小變了整頁重畫"
 
     # 買點燈：多頭拉回月線、收長下影線、量縮 → 閃；少任何一個條件就不閃
     m.live_bar.clear()
@@ -268,7 +269,11 @@ def demo():
     Con.size = (60, 8)
     m.draw(Con, frame("a", "b", "c", "d")); n = sent()
     m.draw(Con, frame("a", "b"))
-    assert "\x1b[3;1H\x1b[0m\x1b[K" in Con.file.getvalue()[n:], "第 3 行的舊字要清掉"
+    assert f"\x1b[3;1H{m.BG_SGR}\x1b[0m{m.BG_SGR}\x1b[K" in Con.file.getvalue()[n:], "第 3 行的舊字要用底色清掉"
+    # 整頁底色：行首先切 BG，rich 每次重設之後切回 BG；沒上色的字落在 BG 上
+    assert m.paint("a\x1b[1mb\x1b[0mc") == f"{m.BG_SGR}a\x1b[1mb\x1b[0m{m.BG_SGR}c"
+    assert m.paint("\x1b[1mb\x1b[0m\x1b[2mc\x1b[0m") == f"{m.BG_SGR}\x1b[1mb\x1b[0m\x1b[2mc\x1b[0m{m.BG_SGR}", \
+        "重設後緊接著色碼就不補 BG，省位元組"
     # 快捷鍵列固定在倒數第二行，空白鍵的說明跟著暫停狀態換
     m.paused = False
     assert "暫停輪動" in m.fkeys().plain and f"1-{len(m.PAGES)}" in m.fkeys().plain

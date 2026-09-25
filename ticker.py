@@ -174,8 +174,12 @@ REFRESH_SEC, IDLE_SEC = 15, 60  # 國際報價（Yahoo）盤中／盤後輪詢�
 # 太密還會被證交所暫時封 IP。ponytail: 5 秒快照是免費來源的極限，要逐筆就換富果/Shioaji WebSocket（要券商帳號）
 TW_SEC = 5
 # 配色取自 TradingView 深色主題：深藍灰底、降飽和的紅與青綠，長時間盯盤不刺眼
-BG, FG = "#131722", "#d1d4dc"  # 開面板時用 OSC 11/10 換掉這個窗格的預設底色與字色，離開時還原
-UP, DOWN = "bold #ef5350", "bold #26a69a"  # 台灣習慣紅漲綠跌，美式就對調
+BG, FG = "#131722", "#d1d4dc"
+PANEL, ZEBRA = "#1a1e2b", "#1e2230"  # 表格、K 線各鋪一層面板底色；表格隔列再亮一階（斑馬紋）代替列間細線
+# 底色由程式自己塗：每一格帶 BG，行尾清行前也先切到 BG（清行會用目前底色填滿）。
+# 原本用 OSC 11 換窗格預設底色，在使用者的 Windows Terminal 上沒生效（整片還是黑的），改成自己塗
+BG_SGR = "\x1b[48;2;{};{};{}m".format(*(int(BG[i:i + 2], 16) for i in (1, 3, 5)))
+UP, DOWN = "#ef5350", "#26a69a"  # 台灣習慣紅漲綠跌，美式就對調。不加粗：TradingView 的數字是一般字重
 FLAT, NAME, SYMBOL, HEADER, TAB = "#9598a1", "bold #e8eaef", "#787b86", "#787b86", "bold #ffffff on #2962ff"
 RULE = "#2a2e39"  # 表頭下方細線顏色
 SEL, SEL_MARK = "on #1e2a4a", "bold #2962ff"  # 選中那一列：暗藍底加左邊一條亮藍線，右邊 K 線就是這一檔
@@ -1022,8 +1026,8 @@ KPANEL_FIXED = 4 + PAT_MAX + VOL_ROWS  # K 線圖以外固定佔幾行：標題�
 MA_GAP = 5            # 均線列各項之間空幾格
 # 均線軌跡：(天數, 標籤, 顏色)。月線紫、季線淺藍、半年線橘，跟紅綠 K 棒都分得開。
 # 疊在同一格時先畫的贏，所以短的排前面
-MA_LINES = ((20, "月線", "#ab47bc"), (60, "季線", "#42a5f5"), (120, "半年", "#ff9800"))
-VOL_UP, VOL_DOWN = "#8c3436", "#1f6e67"  # 量柱比 K 棒暗一階，才不會搶戲
+MA_LINES = ((20, "月線", "#ab47bc"), (60, "季線", "#2962ff"), (120, "半年", "#ff9800"))
+VOL_UP, VOL_DOWN = "#6e2a2d", "#1c5a55"  # 量柱比 K 棒暗一階，才不會搶戲
 VOL_BLOCKS = " ▁▂▃▄▅▆▇█"
 ZOOMS = ((2, 1), (1, 1), (3, 2))  # (每根佔幾格, 棒身幾格)，+ / - 切換
 BAR_UP, BAR_MID, BAR_DOWN = UP, "#b23c3a", DOWN  # 站上季線／只站上月線／跌破月線
@@ -1341,7 +1345,7 @@ def kline_panel(width, rows):
     out.extend(Text("") for _ in range(PAT_MAX - len(pats)))  # 補空行，K 線高度才不會跟著型態數跳
     body = len(out) - PAT_MAX - 2  # 均線列、型態說明置中；標題跟 K 線照舊靠左
     out[body:] = [Text(" " * max(0, (width - 1 - cell_len(t.plain)) // 2)).append_text(t) for t in out[body:]]
-    return Group(*(Text("│", RULE).append_text(t) for t in out))  # 每一行前面補一條分隔線
+    return Group(*(Text(" ").append_text(t) for t in out))  # 左邊留一格；跟表格的分隔改由面板底色與中間的縫負責
 
 
 def sel_items(items):
@@ -1427,14 +1431,16 @@ def render(view, old_rows=None, t=1.0, panel_w=0, height=0):
     grid = Table.grid(expand=True, padding=(0, 2))
     grid.title = f"{tabs}{TAB_GAP}[{SYMBOL}]· {age}s{' ⏸' if paused else ''}[/]"
     for _ in tables:
-        grid.add_column(ratio=1)
+        grid.add_column(ratio=1, style=f"on {PANEL}")  # 表格那一塊的面板底色
     grid.add_row(*tables)
     if not panel_w:
         return Group(index_bar(), grid)
+    # 表格、K 線各一塊面板底色，中間留一格頁面底色當縫；那一格從 K 線寬度扣，表格寬度不變
     outer = Table.grid(expand=True)
     outer.add_column()
-    outer.add_column(width=panel_w)
-    outer.add_row(grid, kline_panel(panel_w, max(4, height - 2)))  # -2：大盤列佔兩行
+    outer.add_column(width=1)
+    outer.add_column(width=panel_w - 1, style=f"on {PANEL}")
+    outer.add_row(grid, "", kline_panel(panel_w - 1, max(4, height - 2)))  # -2：大盤列佔兩行
     return Group(index_bar(), outer)
 
 
@@ -1484,7 +1490,8 @@ def stock_table(hold, new_rows, old_rows, t, span, keep=range(len(COLS))):
         picked = row[1] and row[1] == sel_sym
         if picked:  # 名稱前面那格留白換成亮藍線；翻牌中也照樣標，才看得出選到哪一檔
             cells[0] = Text("▌", SEL_MARK).append_text(cells[0][1:])
-        table.add_row(*(cells[k] for k in keep), Text(""), style=SEL if picked else None)
+        # 選中那列用選取色；其他隔列亮一階（斑馬紋），終端機畫不出列間細線，這是不多佔行的替代
+        table.add_row(*(cells[k] for k in keep), Text(""), style=SEL if picked else f"on {ZEBRA}" if i % 2 else None)
     return table
 
 
@@ -1733,6 +1740,15 @@ FULL_SEC = 10     # 至少每幾秒整頁重畫一次：畫面被別的東西弄
 table_layout = [1, COL_W]  # [表格並排幾欄, 表格區總寬]，render 每幀更新，clicked_row 用
 
 
+def paint(line):
+    """整頁底色：行首先切到 BG，每次 rich 重設樣式（\x1b[0m）之後再切回來。rich 沒上色的字就落在 BG 上；
+    面板、斑馬紋、選取那些自己帶底色的段落照舊。直接改字串，不讓 rich 每一段都多合併一層樣式（那樣每幀多 6ms）。"""
+    return BG_SGR + RESET_THEN_TEXT.sub("\x1b[0m" + BG_SGR, line)
+
+
+RESET_THEN_TEXT = re.compile(r"\x1b\[0m(?!\x1b\[)")  # 重設後緊接著又是色碼的，那段自己會設，不用補 BG
+
+
 def draw(console, renderable):
     """游標回左上角，整頁畫滿窗格（底部留一行），最後一行不換行，所以畫面不會捲動。
     不用 rich Live：alt screen 從 hook／重開窗格時偶爾整片空白；原地模式滿高時每次重畫都會往下捲。"""
@@ -1743,12 +1759,12 @@ def draw(console, renderable):
     buf = Console(file=io.StringIO(), width=width, height=height, force_terminal=True,
                   color_system="truecolor", legacy_windows=False, no_color=False)
     buf.print(renderable, crop=True)
-    lines = buf.file.getvalue().split("\n")[:height]
+    lines = [paint(line) for line in buf.file.getvalue().split("\n")[:height]]
     lines += [""] * (height - len(lines))  # 補滿：換到比較短的頁面時，下面那幾行舊字也要清掉
     buf = Console(file=io.StringIO(), width=width, force_terminal=True,
                   color_system="truecolor", legacy_windows=False, no_color=False)
     buf.print(fkeys(), end="", crop=True, no_wrap=True)
-    lines.append(buf.file.getvalue())  # 快捷鍵列當成最後一行，一起比對、沒變就不重送
+    lines.append(paint(buf.file.getvalue()))  # 快捷鍵列當成最後一行，一起比對、沒變就不重送
     screen[:] = [ANSI.sub("", line) for line in lines]
     # \x1b[?2026h/l：同步更新，終端機等整幀寫完才換上，不會畫一半就顯示（撕裂）
     bar = Console(file=io.StringIO(), width=width, force_terminal=True,
@@ -1760,11 +1776,12 @@ def draw(console, renderable):
     if full:
         drawn_size[:] = [width, height]
         drawn_at[0] = time.time()
-    out = "".join(f"\x1b[{i + 1};1H{line}\x1b[0m\x1b[K" for i, line in enumerate(lines)
+    # 行尾先切到 BG 再清行：清行會用目前的底色填滿，沒切的話右邊留白是終端機的黑
+    out = "".join(f"\x1b[{i + 1};1H{line}\x1b[0m{BG_SGR}\x1b[K" for i, line in enumerate(lines)
                   if full or i >= len(drawn) or drawn[i] != line)
     drawn[:] = lines
-    console.file.write("\x1b[?2026h" + ("\x1b[2J" if full else "") + out
-                       + f"\x1b[{height + FOOTER_LINES};1H" + bar.file.getvalue() + "\x1b[0m\x1b[K"
+    console.file.write("\x1b[?2026h" + (BG_SGR + "\x1b[2J" if full else "") + out
+                       + f"\x1b[{height + FOOTER_LINES};1H" + paint(bar.file.getvalue()) + "\x1b[0m" + BG_SGR + "\x1b[K\x1b[0m"
                        + "\x1b[?2026l")
     if bell:
         console.file.write(chr(7))  # 終端機響一聲，沒盯著面板也知道有警示
@@ -1820,10 +1837,7 @@ def main():
     code_at = Path(__file__).stat().st_mtime
     enable_mouse()
     pending = None  # 翻牌動畫中收到的按鍵／點擊，動畫中斷後馬上處理
-    # OSC 11/10 把這個窗格的預設底色、字色換成配色裡的 BG/FG：清行（\x1b[K）、留白都會是這個底色，
-    # 不用每一格自己塗。只影響面板這個窗格，下面 Claude Code 那格不受影響
-    console.file.write(f"\x1b]11;{BG}\x1b\\\x1b]10;{FG}\x1b\\")
-    console.file.write("\x1b[2J\x1b[?25l")  # 清畫面、藏游標
+    console.file.write(BG_SGR + "\x1b[2J\x1b[?25l")  # 用面板底色清畫面、藏游標
     try:
         while True:
             mtime = reload_if_changed(mtime)
@@ -1885,7 +1899,7 @@ def main():
                 wait_input(FRAME_SEC - time.time() % FRAME_SEC)  # 睡到下一個幀邊界，跑馬燈才勻速；有點擊就提早醒
     finally:
         console.file.write("\x1b[?25h\x1b[?1000l\x1b[?1006l")  # q 離開時把游標、滑鼠還回來
-        console.file.write("\x1b]111\x1b\\\x1b]110\x1b\\")  # 底色、字色還原成終端機設定檔的
+        console.file.write("\x1b[0m\x1b[2J")  # 離開時用終端機原本的底色清掉，不留面板的藍灰
 
 
 if __name__ == "__main__":
