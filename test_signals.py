@@ -66,10 +66,10 @@ def demo():
     m.zoom = 0
     assert m.kline("NOPE", 40, 10) == ([], [], 0), "沒資料回空的"
     assert m.kline("AAA", 40, 2) == ([], [], 0), "行數太少畫不了"
-    used = {s for row in st for s in row if s}
+    used = {s for row in st for s in row if s} - {c for *_, c in m.MA_LINES}
     assert used == {m.BAR_UP}, f"一路上漲的資料每根都該站上均線，拿到 {used}"
     m.bars["BBB"] = [[20 - i * 0.1, 21 - i * 0.1, 19 - i * 0.1, 20.5 - i * 0.1] for i in range(90)]
-    used = {s for row in m.kline("BBB", 40, 10)[1] for s in row if s}
+    used = {s for row in m.kline("BBB", 40, 10)[1] for s in row if s} - {c for *_, c in m.MA_LINES}
     assert used == {m.BAR_DOWN}, f"一路下跌的每根都該跌破月線，拿到 {used}"
 
     # 選取：換頁時自動落在這一頁的第一檔，上下鍵繞一圈
