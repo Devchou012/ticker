@@ -133,11 +133,12 @@ def demo():
     # 閃燈：亮的那半拍兩顆都亮，暗的那半拍都熄成灰
     real_signal, real_time = m.buy_signal, m.time.time
     m.buy_signal = lambda sym: (True, True)
-    styles = lambda: m.buy_light("X").plain.split(" ")
+    lamps = lambda: [(t.plain[s.start:s.end], str(s.style)) for t in [m.buy_light("X")] for s in t.spans]
     m.time.time = lambda: m.FLASH_SEC * 10.5   # 偶數拍：亮
-    assert styles() == [m.ZONE_ON, m.FLOW_ON], "亮拍橘燈、紅燈都亮"
+    assert m.buy_light("X").plain == f"{m.ZONE_ON} {m.FLOW_ON}" and not lamps(), "亮拍兩顆都亮，只有圓點、不塗底色"
     m.time.time = lambda: m.FLASH_SEC * 11.5   # 奇數拍：熄
-    assert styles() == [m.LAMP_OFF, m.LAMP_OFF], "暗拍兩顆都熄"
+    assert lamps() == [(m.LAMP_OFF, m.LAMP_OFF_STYLE)] * 2, "暗拍兩顆都熄成暗灰點"
+    assert m.cell_len(m.LAMP_OFF) == m.cell_len(m.ZONE_ON) == 2, "亮暗寬度一樣，整欄不會跳"
     m.buy_signal, m.time.time = real_signal, real_time
     assert m.FLASH_SEC <= 0.25, "閃燈要比原本的 0.5 秒快"
 

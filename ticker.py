@@ -1189,9 +1189,10 @@ ZONE_LO, ZONE_HI = 1.05, 1.10  # 半年線上方 5%～10%：使用者自己設�
 NEAR_MA = 0.02                 # 低點離月線／季線 2% 內算「拉回到均線附近」
 FLASH_SEC = 0.25               # 閃燈半週期：一秒亮暗各兩次
 # 燈用彩色 emoji 圓點：文字的 ● 只是字形上色，看起來空心；emoji 是整顆填滿的顏色。各佔兩格
-ZONE_ON, FLOW_ON, LAMP_OFF = "🟠", "🔴", "⚫"
-
-
+ZONE_ON, FLOW_ON = "🟠", "🔴"
+# 熄燈：跟網頁一樣是面板色系的暗灰點（emoji ⚫ 是近乎全黑的圓，在藍灰底上像破洞）。
+# 後面補一格空白，寬度跟 emoji 一樣兩格，亮暗切換時整欄不會左右跳
+LAMP_OFF, LAMP_OFF_STYLE = "● ", "#2a2e39"
 def buy_detail(sym):
     """買點的每個條件。用含今天即時那根的 K 線，盤中就會亮；量縮只看已收盤的量。資料不夠回 None。
     簡單流程：季線上揚 → 拉回月線或季線附近又收回 → 量縮 → 止跌 K 棒（長下影、多頭吞噬）或站回月線。
@@ -1249,9 +1250,10 @@ def buy_light(sym):
         return t
     zone, flow = buy_signal(sym)
     on = int(time.time() / FLASH_SEC) % 2 == 0
-    t.append(ZONE_ON if zone and on else LAMP_OFF)
+    # 亮燈只放 emoji 圓點本身，不塗底色：終端機一格只能塗方形，試過塗光暈都有方塊感
+    t.append(ZONE_ON if zone and on else LAMP_OFF, None if zone and on else LAMP_OFF_STYLE)
     t.append(" ")
-    t.append(FLOW_ON if flow and on else LAMP_OFF)
+    t.append(FLOW_ON if flow and on else LAMP_OFF, None if flow and on else LAMP_OFF_STYLE)
     return t
 
 
