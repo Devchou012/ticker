@@ -1,5 +1,5 @@
 """跑馬燈的自我檢查：寬度必須剛好、CJK 切半要補空白、捲動要接得回去。"""
-import importlib.util, sys, time
+import importlib.util, sys
 
 spec = importlib.util.spec_from_file_location("t", "ticker.py")
 m = importlib.util.module_from_spec(spec); sys.modules["t"] = m

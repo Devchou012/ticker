@@ -1,0 +1,21 @@
+# 每次 push、PR：靜態檢查＋全部自我檢查。面板用到 msvcrt，只能在 Windows 跑。
+# 測試都不連網（報價、日線是塞假資料），不會因為 Yahoo 或證交所當掉而失敗
+name: test
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: windows-latest
+    env:
+      PYTHONUTF8: "1"  # 測試輸出有中文，Windows 主控台預設編碼會讓 print 出錯
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - run: pip install rich yfinance flake8  # 跟 install.py 一樣不鎖版本：套件更新弄壞面板，這裡會先亮紅燈
+      # 只查錯誤類（F）；F405 是分層刻意用的 from market import *，不算錯
+      - run: flake8 --select=F --extend-ignore=F405 .
+      - name: 自我檢查
+        shell: bash
+        run: for t in test_*.py; do echo "== $t"; python "$t" || exit 1; done
