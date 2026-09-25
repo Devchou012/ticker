@@ -72,18 +72,20 @@ def demo():
     used = {s for row in m.kline("BBB", 40, 10)[1] for s in row if s} - {c for *_, c in m.MA_LINES}
     assert used == {m.BAR_DOWN}, f"一路下跌的每根都該跌破月線，拿到 {used}"
 
-    # 選取：換頁時自動落在這一頁的第一檔，上下鍵繞一圈
+    # 選取：沒點過或不在這一頁就看加權指數；上下鍵從這一頁第一檔開始，繞一圈
     items = [("AAA", "甲"), ("BBB", "乙"), ("CCC", "丙")]
     m.sel_sym = "ZZZ"
     m.sel_items(items)
-    assert m.sel_sym == "AAA", "不在這一頁就選第一檔"
+    assert m.sel_sym == m.DEFAULT_SYM, "不在這一頁就回到加權指數"
+    m.move_sel(items, 1)
+    assert m.sel_sym == "AAA", "看大盤時按下鍵從第一檔開始"
     m.move_sel(items, 1)
     assert m.sel_sym == "BBB"
     m.move_sel(items, -1)
     m.move_sel(items, -1)
     assert m.sel_sym == "CCC", "往上越界要繞到最後一檔"
     m.sel_items([])
-    assert m.sel_sym is None, "空頁面沒有東西可選"
+    assert m.sel_sym == m.DEFAULT_SYM, "空頁面也看加權指數"
 
     # 點列：從畫面文字反查代號，兩欄並排時取水平位置最近的那個
     m.screen[:] = ["", " 甲  AAA   ...   乙  BBB "]

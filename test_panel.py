@@ -125,8 +125,8 @@ def demo():
     assert not m.buy_signal("BUY")[1], "沒拉回到均線附近不閃"
     setup(slope=-0.2)
     assert not m.buy_signal("BUY")[1], "季線下彎不閃"
-    # 半年線區間：現價在半年線上方 5%～10% 才亮橘燈
-    for ratio, want in ((1.07, True), (1.03, False), (1.12, False)):
+    # 半年線區間：現價在半年線下方 1%～5% 才亮橘燈
+    for ratio, want in ((0.97, True), (1.00, False), (0.995, False), (0.93, False), (1.07, False)):
         m.bars["Z"] = [[100.0] * 4 for _ in range(129)] + [[100.0 * ratio] * 4]  # 只拉開最後一根，半年線幾乎不動
         assert m.buy_signal("Z")[0] == want, f"現價約是半年線的 {ratio} 倍，區間燈應該 {want}"
     assert m.cell_len(m.buy_light("BUY").plain) == 5 and m.buy_light(None).plain == "", "兩顆燈、空列不畫"
@@ -227,8 +227,8 @@ def demo():
     assert "量縮" not in (m.buy_reason("BUY") or ("", "", ""))[1], "紅燈沒亮不寫流程原因"
     m.bars["FLAT"] = [[100.0] * 4 for _ in range(130)]
     assert m.buy_reason("FLAT") is None, "兩顆燈都沒亮就沒有說明"
-    m.bars["Z"] = [[100.0] * 4 for _ in range(129)] + [[107.0] * 4]
-    assert "半年線上" in m.buy_reason("Z")[1], "橘燈寫出離半年線幾 %"
+    m.bars["Z"] = [[100.0] * 4 for _ in range(129)] + [[97.0] * 4]
+    assert "半年線下 3.0%" in m.buy_reason("Z")[1], "橘燈寫出在半年線下方幾 %"
 
     # 滑鼠序列分兩批到：要等後半段到齊，不能把 "52;12M" 當成按鍵
     class Keys:

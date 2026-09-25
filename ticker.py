@@ -273,7 +273,8 @@ def compose(*args, **kwargs):
 
 quotes = Quotes()  # symbol -> (price, prev_close)
 zoom = 0          # ZOOMS 的索引，+ / - 切換 K 棒寬度
-sel_sym = None    # 右側 K 線面板顯示哪一檔
+DEFAULT_SYM = "^TWII"  # 還沒點任何個股時，右側 K 線看加權指數
+sel_sym = DEFAULT_SYM  # 右側 K 線面板顯示哪一檔
 daily = {}        # symbol -> (ma20, ma60, low52, high52)
 daily_date = ""   # 日線統計是哪一天抓的
 daily_busy = False  # 背景在抓日線時不要再開一條
@@ -551,7 +552,8 @@ def poller():
     global last_update, miss_at
     with ThreadPoolExecutor(8, thread_name_prefix=STAGE) as pool:  # 這些執行緒的寫入會先進 staged
         while True:
-            syms = [s for rows in [INDICES, *PAGES.values()] for s, _ in rows if s]  # s 是 None 的是產業分組標題
+            # s 是 None 的是產業分組標題；extra_items 是網頁版各裝置「我的清單」裡的股票
+            syms = list(dict.fromkeys(s for rows in [INDICES, *PAGES.values(), extra_items()] for s, _ in rows if s))
             # 收盤的市場價格不會再動，跳過可以少掉夜裡大半的請求，免得被 Yahoo 限流。
             # 還沒抓到過的照抓，不然剛開面板時收盤市場會整片空白
             syms = [s for s in syms if s not in FUTURES and (s in RATES or session_open(s) or s not in quotes)]
@@ -606,7 +608,7 @@ def tw_poller():
         if session_open("x.TW") or time.time() - twse_at >= IDLE_SEC:
             twse_at = time.time()
             try:
-                fetch_twse([s for rows in [INDICES, *PAGES.values()] for s, _ in rows if s])
+                fetch_twse([s for rows in [INDICES, *PAGES.values(), extra_items()] for s, _ in rows if s])
             except Exception:
                 pass  # 證交所連不上就先用 Yahoo 的延遲價
             if time.time() - saved_at >= FLOW_SAVE_SEC:  # 不限盤中：13:30 收盤那筆常在盤後才進來
@@ -766,7 +768,7 @@ def daily_worker(syms=None):
 
 def daily_syms():
     """要抓日線的：清單裡的個股加上大盤列，扣掉期貨、匯率、類股指數，還有產業分組標題（代號是 None）。"""
-    return sorted({s for rows in [INDICES, *PAGES.values()] for s, _ in rows
+    return sorted({s for rows in [INDICES, *PAGES.values(), extra_items()] for s, _ in rows
                    if s and s not in FUTURES and s not in RATES and s not in SECTOR_SET})
 
 
@@ -1185,7 +1187,7 @@ def vol_rows(sym, width, n):
     return ["".join(r) for r in grid], style
 
 
-ZONE_LO, ZONE_HI = 1.05, 1.10  # 半年線上方 5%～10%：使用者自己設買點的區間
+ZONE_LO, ZONE_HI = 0.95, 0.99  # 現價是半年線的 95%～99%，也就是半年線下方 1%～5%：使用者自己設買點的區間
 NEAR_MA = 0.02                 # 低點離月線／季線 2% 內算「拉回到均線附近」
 FLASH_SEC = 0.25               # 閃燈半週期：一秒亮暗各兩次
 # 燈用彩色 emoji 圓點：文字的 ● 只是字形上色，看起來空心；emoji 是整顆填滿的顏色。各佔兩格
@@ -1202,7 +1204,7 @@ def buy_detail(sym):
         return None
     closes = [b[3] for b in data]
     ma = lambda k, back=0: sum(closes[len(closes) - back - k:len(closes) - back]) / k
-    gap = closes[-1] / ma(120) - 1 if len(closes) >= 120 else None  # 現價在半年線上方幾 %
+    gap = closes[-1] / ma(120) - 1 if len(closes) >= 120 else None  # 現價離半年線幾 %（負的是在下方）
     o, h, l, c = data[-1]
     po, pc = data[-2][0], data[-2][3]
     m20, m60 = ma(20), ma(60)
@@ -1238,7 +1240,7 @@ def buy_reason(sym):
     if flow_ok:
         parts.append(f"季線上揚・回測{d['held']}・量縮・{d['trigger']}")
     if zone:
-        parts.append(f"半年線上 {d['gap']:.1%}")
+        parts.append(f"半年線{'下' if d['gap'] < 0 else '上'} {abs(d['gap']):.1%}")
     return ("買點", "｜".join(parts), UP if flow_ok else MA_LINES[2][2]) if parts else None
 
 
@@ -1351,11 +1353,11 @@ def kline_panel(width, rows):
 
 
 def sel_items(items):
-    """確保 sel_sym 落在這一頁裡；換頁或第一次進來就選第一檔。"""
+    """確保 sel_sym 落在這一頁裡；不在（換頁、剛開）就回到加權指數，不再自動挑這一頁的第一檔。"""
     global sel_sym
     syms = [s for s, _ in items if s]  # 產業分組標題不能被選
     if sel_sym not in syms and sel_sym not in INDEX_SYMS:  # 點了上面的大盤就留著，換頁也不換掉
-        sel_sym = syms[0] if syms else None
+        sel_sym = DEFAULT_SYM
     return syms
 
 
@@ -1802,6 +1804,34 @@ def log_stderr():
     sys.stderr = f
 
 
+# ── 網頁版（另一個 repo：ticker-web）──────────────────────────────────────
+# 旁邊有 ticker-web 資料夾就載入它的 web.py，把這個面板（整個模組）交給它：網頁讀的是這裡記憶體裡的同一批資料。
+# 沒有就只跑終端機。位置可以用環境變數 TICKER_WEB 指定
+WEB_DIR = Path(os.environ.get("TICKER_WEB") or Path(__file__).resolve().parent.parent / "ticker-web")
+
+
+def extra_items():
+    """網頁版各裝置「我的清單」裡的股票，輪詢與補日線也要抓。網頁版載入時會換掉這個函式；沒裝就是空的。"""
+    return []
+
+
+def start_web():
+    if not (WEB_DIR / "web.py").exists():
+        return
+    sys.path.insert(0, str(WEB_DIR))
+    try:
+        import web
+        web.start(sys.modules[__name__])
+    except Exception:
+        import traceback
+        traceback.print_exc()  # 網頁版壞了不影響面板；錯誤寫進 ticker-errors.log
+
+
+def code_mtime():
+    """面板與網頁版程式最後修改的時間：任一個改了，面板就在原窗格用新版重開。"""
+    return max(f.stat().st_mtime for f in (Path(__file__), WEB_DIR / "web.py") if f.exists())
+
+
 def main():
     global paused, zoom, sel_sym
     # 從 Claude Code hook 啟動時環境帶著固定的 COLUMNS/LINES，rich 會照它畫、不看窗格真實大小
@@ -1825,6 +1855,8 @@ def main():
     threading.Thread(target=poller, daemon=True).start()
     threading.Thread(target=tw_poller, daemon=True).start()
     threading.Thread(target=fugle_worker, daemon=True).start()
+    if "--once" not in sys.argv:
+        start_web()  # 網頁版：http://127.0.0.1:47654
     idx = 0
     if "--once" in sys.argv:  # 自我檢查：抓一輪、印出所有頁
         while not last_update:
@@ -1836,14 +1868,14 @@ def main():
     console = Console(force_terminal=True, color_system="truecolor", legacy_windows=False, no_color=False)
     shown = time.time()
     mtime = reload_if_changed(None)
-    code_at = Path(__file__).stat().st_mtime
+    code_at = code_mtime()
     enable_mouse()
     pending = None  # 翻牌動畫中收到的按鍵／點擊，動畫中斷後馬上處理
     console.file.write(BG_SGR + "\x1b[2J\x1b[?25l")  # 用面板底色清畫面、藏游標
     try:
         while True:
             mtime = reload_if_changed(mtime)
-            if Path(__file__).stat().st_mtime != code_at:
+            if code_mtime() != code_at:
                 sys.exit(3)  # 程式碼改了：外層會用新版重跑，同一個窗格
             # -1：draw() 底部留一行。每圈重算，拖拉窗格高度會自動重新分頁
             # 右側 K 線面板吃掉的寬度要先扣掉，表格才知道自己能用多少
