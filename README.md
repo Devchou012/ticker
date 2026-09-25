@@ -135,11 +135,25 @@ python watch.py                     # 列出
 | `MA_GAP` | 5 | K 線下方均線列的項目間隔 |
 | `BG`、`PANEL`、`ZEBRA` 等 | TradingView 色票 | 配色 |
 
+## 程式結構
+
+拆成三層，上層可以讀下層，下層不知道上層：
+
+| 檔案 | 層 | 內容 | 不依賴 |
+|---|---|---|---|
+| `market.py` | 資料層 | 報價、日線、籌碼、內外盤的儲存與抓取；交易日曆、資料來源狀態、背景輪詢、存檔 | 畫面（沒有 rich、沒有顏色） |
+| `signals.py` | 判斷層 | 乖離、年區間、外資、過期、多空比、買點、弱勢、型態、異動排行；一列的完整判斷 `row()` | 畫面 |
+| `ticker.py` | 畫面層 | 顏色、表格、K 線、跑馬燈、快捷鍵、輸入、主迴圈，載入網頁版 | — |
+
+判斷層回傳語意而不是顏色（`up`、`down`、`flat`、`hot`、`cold`、`volhot`、`vollow`、`dim`、`zone`），終端機用 `TONE` 對照表配色，網頁版自己配色。會被重新指定的狀態（名單 `PAGES`、`HOLD`、最後更新時間、響鈴）一律住在資料層，其他層讀 `market.PAGES` 這種寫法，不用 `from market import *` 拿到的副本。
+
 ## 檔案
 
 | 檔案 | 用途 |
 |---|---|
-| `ticker.py` | 面板本體 |
+| `ticker.py` | 畫面層與進入點 |
+| `market.py` | 資料層 |
+| `signals.py` | 判斷層 |
 | `watch.py` | 觀察清單增刪 |
 | `install.py` | 新機器安裝 |
 | `stocks.cmd` / `autostart.ps1` | 開新視窗／從 Claude Code 自動分割窗格 |
@@ -178,16 +192,18 @@ python watch.py                     # 列出
 
 網頁版在另一個 repo：[ticker-web](https://github.com/Devchou012/ticker-web)（私人）。把它 clone 到跟 `ticker` 同一層，面板啟動時就會自動載入，開 http://127.0.0.1:47654 就能看；iPhone、iPad 在同一個 Wi-Fi 下掃 QR code 連線。
 
-網頁版不自己抓資料，讀的是面板記憶體裡的同一批報價與燈號，不會多打請求。面板這邊只留三個接口：
-- `start_web()`：旁邊有 `ticker-web/web.py` 就載入，把面板模組交給它；沒有就只跑終端機。位置可用環境變數 `TICKER_WEB` 指定。
-- `extra_items()`：網頁版各裝置「我的清單」裡的股票，輪詢與補日線也會抓。
-- `code_mtime()`：`ticker.py` 或 `web.py` 任一個改了，面板都會在原窗格用新版重開。
+網頁版不自己抓資料，讀的是面板記憶體裡的同一批報價與燈號，不會多打請求。它只讀資料層與判斷層，不碰終端機畫面。接口：
+- `ticker.start_web()`：旁邊有 `ticker-web/web.py` 就載入；沒有就只跑終端機。位置可用環境變數 `TICKER_WEB` 指定。
+- `market.extra_items`：網頁版把它換成「各裝置我的清單裡的股票」，輪詢與補日線也會抓。
+- `ticker.code_mtime()`：`ticker.py`、`market.py`、`signals.py`、`web.py` 任一個改了，面板都會在原窗格用新版重開。
 
 功能、手機連線、安全設計、計畫與編輯紀錄見 ticker-web 的 README。
 
 ## 變更紀錄
 
 **2026-09-26**
+- 拆成三層：`market.py`（資料）、`signals.py`（判斷，回傳語意）、`ticker.py`（畫面）。行為不變：回測 22 萬個交易日結果完全相同，新舊網頁 API 逐列比對一致。
+- 發現：Yahoo 逐檔查價（`fast_info`）的昨收會錯（例如 NVDA 223.82，實際 224.58），改成批次查價後的昨收跟日 K 一致，美股、日股的漲跌幅因此變準。
 - 資料可靠性：Yahoo 改批次查價（每輪約 95 個請求 → 2 個），失敗整批改問 CNBC；證交所休市日曆；美股夏令時間；資料來源狀態燈。
 - 回測（`backtest.py`）：紅燈加上「半年線上揚」；橘燈改成弱勢提醒（恆亮不閃），欄名改「訊號」。
 

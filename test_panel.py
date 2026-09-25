@@ -4,7 +4,8 @@ import importlib.util, re, sys, time
 spec = importlib.util.spec_from_file_location("t", "ticker.py")
 m = importlib.util.module_from_spec(spec); sys.modules["t"] = m
 spec.loader.exec_module(m)
-real_session_open = m.session_open  # 有些測試會換掉它，要用真的時從這裡拿
+mk, sg = sys.modules["market"], sys.modules["signals"]  # 資料層、判斷層：要替換的變數與函式住在這兩層
+real_session_open = mk.session_open  # 有些測試會換掉它，要用真的時從這裡拿
 
 
 def demo():
@@ -39,14 +40,14 @@ def demo():
     # 過期：盤中超過 STALE_SEC 沒新報價就壓暗；收盤市場不算
     m.quotes.clear()
     m.quotes["2330.TW"] = (1000.0, 990.0)
-    m.session_open = lambda sym: True
+    mk.session_open = lambda sym: True
     assert not m.stale("2330.TW"), "剛寫入不算過期"
     m.quote_at["2330.TW"] = time.time() - m.STALE_SEC - 1
     assert m.stale("2330.TW"), "盤中太久沒更新要算過期"
     row = m.rows_of([("2330.TW", "台積電")])[0]
     assert row[7] == m.STALE and row[4] == "1,000.00", "過期列保留數字、換成暗色"
     assert not m.stale("FED"), "利率一小時抓一次，不算過期"
-    m.session_open = lambda sym: False
+    mk.session_open = lambda sym: False
     assert not m.stale("2330.TW"), "收盤市場不會更新，不算過期"
 
     # 月線軌跡：只補在空白格，不能蓋掉 K 棒
@@ -118,28 +119,28 @@ def demo():
         m.bars["BUY"][-1] = [o, c + 0.05, low, c]
         m.vols["BUY"] = [100.0] * 167 + ([40.0] * 3 if quiet else [300.0] * 3)
     setup()
-    assert m.buy_signal("BUY")[1], "條件全部成立要閃"
+    assert sg.buy_signal("BUY")[1], "條件全部成立要閃"
     setup(quiet=False)
-    assert not m.buy_signal("BUY")[1], "沒量縮不閃"
+    assert not sg.buy_signal("BUY")[1], "沒量縮不閃"
     setup(hammer=False)
-    assert not m.buy_signal("BUY")[1], "沒止跌 K 棒不閃"
+    assert not sg.buy_signal("BUY")[1], "沒止跌 K 棒不閃"
     setup(last_low_gap=0.05)
-    assert not m.buy_signal("BUY")[1], "沒拉回到均線附近不閃"
+    assert not sg.buy_signal("BUY")[1], "沒拉回到均線附近不閃"
     setup(slope=-0.2)
-    assert not m.buy_signal("BUY")[1], "季線下彎不閃"
+    assert not sg.buy_signal("BUY")[1], "季線下彎不閃"
     setup(head=60)
     d = m.buy_detail("BUY")
-    assert d["rising"] and not d["ma120_up"] and not m.buy_signal("BUY")[1], "季線上揚但半年線下彎，不閃（回測後加的條件）"
+    assert d["rising"] and not d["ma120_up"] and not sg.buy_signal("BUY")[1], "季線上揚但半年線下彎，不閃（回測後加的條件）"
     m.bars["SHORT"] = m.bars["BUY"][-130:]
     assert not m.buy_detail("SHORT")["ma120_up"], "不到 140 根算不出半年線斜率，不亮"
     # 橘燈（弱勢提醒）：現價在半年線下方 1%～5% 才亮
     for ratio, want in ((0.97, True), (1.00, False), (0.995, False), (0.93, False), (1.07, False)):
         m.bars["Z"] = [[100.0] * 4 for _ in range(129)] + [[100.0 * ratio] * 4]  # 只拉開最後一根，半年線幾乎不動
-        assert m.buy_signal("Z")[0] == want, f"現價約是半年線的 {ratio} 倍，區間燈應該 {want}"
+        assert sg.buy_signal("Z")[0] == want, f"現價約是半年線的 {ratio} 倍，區間燈應該 {want}"
     assert m.cell_len(m.buy_light("BUY").plain) == 5 and m.buy_light(None).plain == "", "兩顆燈、空列不畫"
     # 燈號：紅燈（買點）閃爍；橘燈（弱勢提醒）恆亮不閃，免得被看成買點
-    real_signal, real_time = m.buy_signal, m.time.time
-    m.buy_signal = lambda sym: (True, True)
+    real_signal, real_time = sg.buy_signal, m.time.time
+    sg.buy_signal = lambda sym: (True, True)
     lamps = lambda: [(t.plain[s.start:s.end], str(s.style)) for t in [m.buy_light("X")] for s in t.spans]
     m.time.time = lambda: m.FLASH_SEC * 10.5   # 偶數拍：亮
     assert m.buy_light("X").plain == f"{m.ZONE_ON} {m.FLOW_ON}" and not lamps(), "亮拍兩顆都亮，只有圓點、不塗底色"
@@ -147,7 +148,7 @@ def demo():
     assert m.buy_light("X").plain == f"{m.ZONE_ON} {m.LAMP_OFF}", "暗拍：橘燈照樣亮著，只有紅燈熄"
     assert lamps() == [(m.LAMP_OFF, m.LAMP_OFF_STYLE)], "熄的紅燈是暗灰點"
     assert m.cell_len(m.LAMP_OFF) == m.cell_len(m.ZONE_ON) == 2, "亮暗寬度一樣，整欄不會跳"
-    m.buy_signal, m.time.time = real_signal, real_time
+    sg.buy_signal, m.time.time = real_signal, real_time
     assert m.FLASH_SEC <= 0.25, "閃燈要比原本的 0.5 秒快"
 
     # 點大盤：從畫面反查點到哪一個，選了之後換頁不會被換掉，上下鍵回到個股
@@ -200,19 +201,19 @@ def demo():
     # 表頭跟著這一頁是不是台股換
     head = lambda syms: m.stock_table(False, [(n, n, "", "", "", "", "", None, "", "", "", "", "", "", "", "", "")
                                                for n in syms], None, 1.0, range(len(syms))).columns[2].header.plain
-    m.session_open = lambda sym: True
+    mk.session_open = lambda sym: True
     assert head(["2330.TW"]) == "多空比" and head(["NVDA"]) == "今日區間" and head(["2330.TW", "NVDA"]) == "多空／區間"
     # 收盤、國定假日切回今日區間
-    m.session_open = lambda sym: False
+    mk.session_open = lambda sym: False
     assert head(["2330.TW"]) == "今日區間", "收盤後切回今日區間"
-    m.session_open = lambda sym: True
+    mk.session_open = lambda sym: True
     m.flow["2330.TW"] = ["19990101", 1.0, 1.0, 10.0, None, None]
     assert not m.shows_flow("2330.TW"), "MIS 的交易日不是今天＝國定假日沒開盤"
     m.flow["2330.TW"][0] = m.time.strftime("%Y%m%d")
     assert m.shows_flow("2330.TW")
 
     # 存檔：讀回來接著算，關著那段的量不算進任何一邊
-    m.FLOW_FILE = m.Path(__import__("tempfile").gettempdir()) / "ticker_flow_test.json"
+    mk.FLOW_FILE = m.Path(__import__("tempfile").gettempdir()) / "ticker_flow_test.json"
     today = m.time.strftime("%Y%m%d")
     m.flow.clear(); m.flow_exact.clear()
     m.flow["S.TW"] = [today, 60.0, 40.0, 1000.0, 99.0, 100.0]
@@ -225,7 +226,7 @@ def demo():
     assert m.flow["S.TW"][1:4] == [60.0, 40.0, 5000.0], "重開後第一筆不算量"
     m.note_flow("S.TW", snap("100.0", 5010, d=today))
     assert m.flow["S.TW"][1] == 70.0, "之後照常累計"
-    m.FLOW_FILE.unlink()
+    mk.FLOW_FILE.unlink()
 
     # 閃燈原因：燈亮才有，寫出成立的是哪幾項
     setup()
@@ -286,11 +287,11 @@ def demo():
         "重設後緊接著色碼就不補 BG，省位元組"
     # 快捷鍵列固定在倒數第二行，空白鍵的說明跟著暫停狀態換
     m.paused = False
-    assert "暫停輪動" in m.fkeys().plain and f"1-{len(m.PAGES)}" in m.fkeys().plain
+    assert "暫停輪動" in m.fkeys().plain and f"1-{len(mk.PAGES)}" in m.fkeys().plain
     m.paused = True
     assert "繼續輪動" in m.fkeys().plain
     m.paused = False
-    assert len(m.screen) == 8 - 1 and m.screen[-1].strip().startswith(f"1-{len(m.PAGES)}"), \
+    assert len(m.screen) == 8 - 1 and m.screen[-1].strip().startswith(f"1-{len(mk.PAGES)}"), \
         "8 行高的窗格：內容 6 行 + 快捷鍵列（倒數第二行），最後一行是跑馬燈"
     Con.size = (50, 6)
     m.draw(Con, frame("a", "X", "c"))  # 還原成下面那段用的窗格大小
@@ -323,12 +324,12 @@ def demo():
     rows = [{"Name": "中秋節", "Date": "1150925"}, {"Name": "國曆新年開始交易日", "Date": "1150102"},
             {"Name": "市場無交易，僅辦理結算交割作業", "Date": "1150212"}, {"Name": "壞資料", "Date": "115"}]
     assert m.holidays_from(rows) == {"20260925", "20260212"}, m.holidays_from(rows)
-    real_hol, real_so = set(m.tw_holidays), m.session_open
-    m.session_open = real_session_open  # 前面的測試換掉過，這裡要用真的
+    real_hol, real_so = set(m.tw_holidays), mk.session_open
+    mk.session_open = real_session_open  # 前面的測試換掉過，這裡要用真的
     m.tw_holidays.clear(); m.tw_holidays.add(m.time.strftime("%Y%m%d"))
-    assert m.tw_closed() and not m.session_open("2330.TW"), "休市日台股不算開盤"
+    assert m.tw_closed() and not mk.session_open("2330.TW"), "休市日台股不算開盤"
     assert m.volume_ratio("2330.TW", 100, 100)[0] == "1.0x", "休市日量比用整日量，不照開盤比例放大"
-    m.tw_holidays.clear(); m.tw_holidays.update(real_hol); m.session_open = real_so
+    m.tw_holidays.clear(); m.tw_holidays.update(real_hol); mk.session_open = real_so
     # 美股開盤：夏令 21:30、冬令 22:30（台灣時間）
     from datetime import datetime as dt
     from zoneinfo import ZoneInfo
