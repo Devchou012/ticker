@@ -272,6 +272,22 @@ def demo():
     n = sent(); m.draw(Con, frame("a", "X", "c"))
     assert "\x1b[2J" in Con.file.getvalue()[n:], "超過 FULL_SEC 要整頁重畫"
 
+    # 同步：Yahoo 平行抓取先暫存，整圈 publish 才看得到；組畫面時寫入要等
+    import threading
+    m.quotes.clear(); m.staged.clear()
+    worker = threading.Thread(target=lambda: m.quotes.__setitem__("Y1", (10.0, 9.0)), name=m.STAGE + "_0")
+    worker.start(); worker.join()
+    assert "Y1" not in m.quotes and m.staged == {"Y1": (10.0, 9.0)}, "Yahoo 執行緒的寫入先進暫存"
+    m.quotes["MAIN"] = (1.0, 1.0)
+    assert "MAIN" in m.quotes, "其他執行緒照常直接寫"
+    m.frame_lock.acquire()  # 假裝正在組一幀
+    pub = threading.Thread(target=m.publish, args=({"Y1": (10.0, 9.0), "Y2": (20.0, 19.0)},))
+    pub.start(); pub.join(0.05)
+    assert pub.is_alive() and "Y1" not in m.quotes, "組畫面途中不能寫進去"
+    m.frame_lock.release(); pub.join()
+    assert m.quotes["Y1"] == (10.0, 9.0) and m.quotes["Y2"] == (20.0, 19.0), "組完一幀後整批一起寫入"
+    m.staged.clear()
+
     # 底色只留給警示與跳價閃燈
     for st in (m.DEV_HOT, m.DEV_COLD, m.VOL_HOT_STYLE):
         assert " on " not in st, f"{st} 不該帶底色"

@@ -235,11 +235,33 @@ STALE_SEC = 90  # 盤中超過這麼久沒拿到新報價就整列變暗；Yahoo
 STALE = "#555555"
 
 
+frame_lock = threading.Lock()  # 組一幀畫面時拿著；整批報價寫入也要拿。一幀裡看到的一定是同一批資料
+STAGE = "yahoo"                # Yahoo 那一圈平行抓取的執行緒名稱前綴：它們的寫入先暫存，整圈抓完一次寫入
+staged = {}
+
+
 class Quotes(dict):
     """寫入時順便記時間。報價來源有七八條（Yahoo、MIS、期交所、CNBC、富果…），都經過這裡，不用一個個改。"""
     def __setitem__(self, sym, q):
+        if threading.current_thread().name.startswith(STAGE):
+            staged[sym] = q  # 8 條執行緒誰先回來誰先寫的話，一頁的報價會在一兩秒內零零落落地跳
+            return
         quote_at[sym] = time.time()
         super().__setitem__(sym, q)
+
+
+def publish(batch):
+    """整批報價一次寫進去，跟組畫面互斥：同一頁在同一幀一起跳，不會一半新一半舊。跳價亮燈也一起標。"""
+    with frame_lock:
+        for sym, q in batch.items():
+            quotes[sym] = q
+        mark_ticks()
+
+
+def compose(*args, **kwargs):
+    """組一幀畫面。拿著 frame_lock，組的途中背景不能寫報價，整幀用的是同一批資料。"""
+    with frame_lock:
+        return render(*args, **kwargs)
 
 
 quotes = Quotes()  # symbol -> (price, prev_close)
@@ -301,28 +323,37 @@ def fetch_twse(syms):
     ctx = ssl.create_default_context()
     ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT  # 同期交所：憑證缺 3.13 嚴格模式要的欄位
     keys = list(chans)
+    msgs = []
     for i in range(0, len(keys), 50):  # 一次查 50 檔
         url = TWSE_MIS + "|".join(f"{k}.tw" for k in keys[i:i + 50])  # 代號大小寫要照原樣（00631L）
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        for r in json.load(urllib.request.urlopen(req, timeout=10, context=ctx)).get("msgArray", []):
-            sym = chans.get(f"{r.get('ex')}_{r.get('c')}")
-            if not sym:
-                continue
-            try:
-                # z 是最近成交價；快照剛好落在兩筆成交之間時是 "-"，改用最佳買價
-                price = float(r["z"]) if r.get("z", "-") != "-" else float(r["b"].split("_")[0])
-                prev = float(r["y"])
-            except (KeyError, ValueError, AttributeError):
-                continue
-            note_flow(sym, r)  # 放在富果判斷前面：選中那檔也要照樣累計，富果斷線時才有推估值可以接手
-            if time.time() - fugle_at.get(sym, 0) < FUGLE_FRESH:
-                continue  # 富果逐筆比 MIS 快照新，別用舊的蓋回去
-            old = quotes.get(sym, ())
-            avg = old[3] if len(old) > 3 else None
-            vol = float(r["v"]) * 1000 if r.get("v") else None  # MIS 成交量單位是張
-            quotes[sym] = (price, prev, vol, avg, float(r["l"]), float(r["h"]))
-            if r.get("o", "-") != "-" and r.get("d"):  # 開盤前還沒有開盤價，今天那根先不畫
-                live_bar[sym] = (r["d"], float(r["o"]), float(r["h"]), float(r["l"]), price)
+        msgs += json.load(urllib.request.urlopen(req, timeout=10, context=ctx)).get("msgArray", [])
+    with frame_lock:  # 每一批都抓完才一起寫：同一頁的台股在同一幀一起跳，不會前一批先跳、後一批晚一拍
+        store_twse(chans, msgs)
+        mark_ticks()
+
+
+def store_twse(chans, msgs):
+    """把 MIS 回來的快照寫進報價、今天那根 K 棒與內外盤。呼叫端要拿著 frame_lock。"""
+    for r in msgs:
+        sym = chans.get(f"{r.get('ex')}_{r.get('c')}")
+        if not sym:
+            continue
+        try:
+            # z 是最近成交價；快照剛好落在兩筆成交之間時是 "-"，改用最佳買價
+            price = float(r["z"]) if r.get("z", "-") != "-" else float(r["b"].split("_")[0])
+            prev = float(r["y"])
+        except (KeyError, ValueError, AttributeError):
+            continue
+        note_flow(sym, r)  # 放在富果判斷前面：選中那檔也要照樣累計，富果斷線時才有推估值可以接手
+        if time.time() - fugle_at.get(sym, 0) < FUGLE_FRESH:
+            continue  # 富果逐筆比 MIS 快照新，別用舊的蓋回去
+        old = quotes.get(sym, ())
+        avg = old[3] if len(old) > 3 else None
+        vol = float(r["v"]) * 1000 if r.get("v") else None  # MIS 成交量單位是張
+        quotes[sym] = (price, prev, vol, avg, float(r["l"]), float(r["h"]))
+        if r.get("o", "-") != "-" and r.get("d"):  # 開盤前還沒有開盤價，今天那根先不畫
+            live_bar[sym] = (r["d"], float(r["o"]), float(r["h"]), float(r["l"]), price)
 
 
 CNBC_URL = ("https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol?symbols={}"
@@ -511,13 +542,16 @@ def tick_style(sym):
 
 def poller():
     global last_update, miss_at
-    with ThreadPoolExecutor(8) as pool:
+    with ThreadPoolExecutor(8, thread_name_prefix=STAGE) as pool:  # 這些執行緒的寫入會先進 staged
         while True:
             syms = [s for rows in [INDICES, *PAGES.values()] for s, _ in rows if s]  # s 是 None 的是產業分組標題
             # 收盤的市場價格不會再動，跳過可以少掉夜裡大半的請求，免得被 Yahoo 限流。
             # 還沒抓到過的照抓，不然剛開面板時收盤市場會整片空白
             syms = [s for s in syms if s not in FUTURES and (s in RATES or session_open(s) or s not in quotes)]
             list(pool.map(fetch, syms))  # 台股、台指期交給 tw_poller
+            batch = dict(staged)
+            staged.clear()
+            publish(batch)  # 整圈都回來了才一次寫進去，這一圈的報價在同一幀一起跳
             missing = [s for s in syms if s not in quotes]  # 多半是 Yahoo 限流，整批空手而回
             if missing:
                 try:
@@ -1274,8 +1308,13 @@ def kline_panel(width, rows):
     vl, vs = vol_rows(sel_sym, width - 2, n)
     for row, st in zip(lines + vl, styles + vs):
         # 同色相連的格子併成一段再上色。一格一段的話每格都帶一組色碼，K 線面板一幀就四十幾 KB
-        t = Text(" ")
-        for s, run in groupby(zip(row, st), key=lambda z: z[1]):
+        # 空格沒有底色、看不出前景色，就沿用前一格的顏色：「█ █ █」這種 K 棒、量柱中間夾空格的，
+        # 本來要切成五段、每段重設一次色碼，併起來變一段。換股時要轉的段數跟送出的位元組都少一大半
+        t, carry, cells = Text(" "), None, []
+        for ch, s in zip(row, st):
+            carry = s if ch != " " else carry
+            cells.append((ch, carry))
+        for s, run in groupby(cells, key=lambda z: z[1]):
             t.append("".join(ch for ch, _ in run), s or None)
         out.append(t)
     data = candles(sel_sym)
@@ -1768,7 +1807,7 @@ def main():
             names = views_for(console.height - 1, console.width - panel_w)
             idx %= len(names)
             key, pending = pending or read_key(), None
-            new = (idx + 1) % len(names) if not paused and time.time() - shown >= AUTO_SEC else idx
+            new = idx
             if key == "q":
                 return
             if key == " ":  # 空白鍵定住這一頁，標題出現 ⏸；再按一次恢復自動翻頁
@@ -1798,18 +1837,21 @@ def main():
             elif isinstance(key, str) and key.isdigit() and 1 <= int(key) <= len(PAGES):
                 market = list(PAGES)[int(key) - 1]
                 new = next(i for i, v in enumerate(names) if v[0] == market)
+            if not key and not paused and time.time() - shown >= AUTO_SEC:
+                # 自動翻頁放在處理完輸入之後：原本先排好翻頁再處理點擊，剛好到點時點了個股、畫面卻翻走
+                new = (idx + 1) % len(names)
             if new != idx:
                 old_rows, idx = rows_of(names[idx][1], names[idx][0] == "庫存"), new
                 speed = FLIP_FAST if key else 1  # 自己點的換頁動畫加快；自動輪動照原本的節奏慢慢翻
                 t0 = time.time()
                 while (t := (time.time() - t0) * speed) < FLIP_SEC:
-                    draw(console, render(names[idx], old_rows, t, panel_w, console.height - 1))
+                    draw(console, compose(names[idx], old_rows, t, panel_w, console.height - 1))
                     wait_input(1 / 30)
                     if pending := read_key():  # 翻牌中又點了別頁：不等動畫跑完，直接換
                         break
                 shown = time.time()
             if not pending:
-                draw(console, render(names[idx], panel_w=panel_w, height=console.height - 1))
+                draw(console, compose(names[idx], panel_w=panel_w, height=console.height - 1))
                 wait_input(FRAME_SEC - time.time() % FRAME_SEC)  # 睡到下一個幀邊界，跑馬燈才勻速；有點擊就提早醒
     finally:
         console.file.write("\x1b[?25h\x1b[?1000l\x1b[?1006l")  # q 離開時把游標、滑鼠還回來
