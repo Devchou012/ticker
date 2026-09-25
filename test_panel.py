@@ -4,6 +4,7 @@ import importlib.util, re, sys, time
 spec = importlib.util.spec_from_file_location("t", "ticker.py")
 m = importlib.util.module_from_spec(spec); sys.modules["t"] = m
 spec.loader.exec_module(m)
+real_session_open = m.session_open  # 有些測試會換掉它，要用真的時從這裡拿
 
 
 def demo():
@@ -317,6 +318,55 @@ def demo():
     m.frame_lock.release(); pub.join()
     assert m.quotes["Y1"] == (10.0, 9.0) and m.quotes["Y2"] == (20.0, 19.0), "組完一幀後整批一起寫入"
     m.staged.clear()
+
+    # 休市日曆：民國年換西元；「開始／最後交易日」照常交易，「市場無交易」算休市
+    rows = [{"Name": "中秋節", "Date": "1150925"}, {"Name": "國曆新年開始交易日", "Date": "1150102"},
+            {"Name": "市場無交易，僅辦理結算交割作業", "Date": "1150212"}, {"Name": "壞資料", "Date": "115"}]
+    assert m.holidays_from(rows) == {"20260925", "20260212"}, m.holidays_from(rows)
+    real_hol, real_so = set(m.tw_holidays), m.session_open
+    m.session_open = real_session_open  # 前面的測試換掉過，這裡要用真的
+    m.tw_holidays.clear(); m.tw_holidays.add(m.time.strftime("%Y%m%d"))
+    assert m.tw_closed() and not m.session_open("2330.TW"), "休市日台股不算開盤"
+    assert m.volume_ratio("2330.TW", 100, 100)[0] == "1.0x", "休市日量比用整日量，不照開盤比例放大"
+    m.tw_holidays.clear(); m.tw_holidays.update(real_hol); m.session_open = real_so
+    # 美股開盤：夏令 21:30、冬令 22:30（台灣時間）
+    from datetime import datetime as dt
+    from zoneinfo import ZoneInfo
+    assert m.us_open(dt(2026, 7, 1, 12, tzinfo=ZoneInfo("America/New_York"))) == 21 * 60 + 30, "夏令時間"
+    assert m.us_open(dt(2026, 12, 1, 12, tzinfo=ZoneInfo("America/New_York"))) == 22 * 60 + 30, "冬令時間"
+    assert m.window(".TW") == m.SESSIONS[".TW"]
+
+    # 資料來源狀態：沒抓過灰、失敗紅、該有資料卻太久沒成功黃、正常綠
+    m.src_state.clear()
+    assert m.src_status("證交所", True) == "idle"
+    m.note_src("證交所", False, "TimeoutError")
+    assert m.src_status("證交所", True) == "err" and m.src_state["證交所"][2] == "TimeoutError"
+    m.note_src("證交所", True)
+    assert m.src_status("證交所", True) == "ok", "成功之後恢復"
+    m.src_state["證交所"][0] -= m.SRC_LIMIT["證交所"] + 1
+    assert m.src_status("證交所", True) == "old" and m.src_status("證交所", False) == "ok", "收盤時沒資料不算停"
+    assert [n for n, _, _ in m.sources()] == ["證交所", "期交所", "Yahoo"], "沒設富果就不列"
+    m.src_state.clear()
+
+    # Yahoo 批次：一次問一批；缺價格的略過；整批失敗記成紅燈、回傳空的讓呼叫端改問 CNBC
+    class FakeYf:
+        calls = []
+        def get_raw_json(self, url, params):
+            FakeYf.calls.append(params["symbols"])
+            if "BAD" in params["symbols"]:
+                raise RuntimeError("YFRateLimitError")
+            return {"quoteResponse": {"result": [
+                {"symbol": "NVDA", "regularMarketPrice": 200.0, "regularMarketPreviousClose": 195.0, "regularMarketVolume": 10,
+                 "averageDailyVolume10Day": 20, "regularMarketDayLow": 190.0, "regularMarketDayHigh": 201.0},
+                {"symbol": "NOPRICE", "regularMarketPrice": None, "regularMarketPreviousClose": 1.0}]}}
+    real_yfd = m.yf.data.YfData
+    m.yf.data.YfData = FakeYf
+    got = m.fetch_yahoo(["NVDA", "NOPRICE"] + [f"X{i}" for i in range(60)])
+    assert got == {"NVDA": (200.0, 195.0, 10, 20, 190.0, 201.0)} and len(FakeYf.calls) == 2, "62 檔分兩批問、缺價格的略過"
+    assert m.src_status("Yahoo", True) == "ok"
+    assert m.fetch_yahoo(["BAD"]) == {} and m.src_status("Yahoo", True) == "err", "整批失敗記紅燈"
+    m.yf.data.YfData = real_yfd
+    m.src_state.clear()
 
     # 底色只留給警示與跳價閃燈
     for st in (m.DEV_HOT, m.DEV_COLD, m.VOL_HOT_STYLE):

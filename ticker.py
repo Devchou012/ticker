@@ -14,7 +14,9 @@ import urllib.parse
 import urllib.request
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from itertools import groupby
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 
@@ -295,6 +297,102 @@ last_update = 0.0
 paused = False  # 空白鍵暫停自動翻頁，想盯著某一頁看的時候用
 
 
+# ── 資料來源狀態：每個來源最後一次成功／失敗的時間，終端機快捷鍵列與網頁都會顯示 ──
+SRC_LIMIT = {"證交所": 30, "期交所": 30, "Yahoo": 120, "富果": 60}  # 該有資料的時段裡，超過幾秒沒成功算「停了」
+src_state = {}  # 名稱 -> [最後成功時間, 最後失敗時間, 失敗原因, 最後一次是否成功]
+
+
+def note_src(name, ok, why=""):
+    st = src_state.setdefault(name, [0.0, 0.0, "", True])
+    if ok:
+        st[0] = time.time()
+    else:
+        st[1], st[2] = time.time(), str(why)[:80]
+    st[3] = ok  # 先後看這個，不比時間：Windows 時間精度約 15ms，同一個時間點分不出先後
+
+
+def src_status(name, active):
+    """ok（正常）／err（上一次失敗）／old（該有資料卻太久沒成功）／idle（還沒抓過）。active：現在應不應該有資料。"""
+    ok, err, _, last_ok = src_state.get(name, (0.0, 0.0, "", True))
+    if not ok and not err:
+        return "idle"
+    if not last_ok:
+        return "err"
+    return "old" if active and time.time() - ok > SRC_LIMIT.get(name, 120) else "ok"
+
+
+def sources():
+    """[(名稱, 狀態, 失敗原因)]。富果沒設金鑰就不列。"""
+    tw = session_open("x.TW")
+    rows = [("證交所", tw), ("期交所", futures_open()), ("Yahoo", market_hours())] + ([("富果", tw)] if "富果" in src_state else [])
+    return [(n, src_status(n, active), src_state.get(n, [0, 0, "", True])[2]) for n, active in rows]
+
+
+# ── 交易日曆：台股休市日（證交所公布），美股夏令時間 ──
+HOLIDAY_URL = "https://openapi.twse.com.tw/v1/holidaySchedule/holidaySchedule"
+tw_holidays = set()  # "YYYYMMDD"
+holiday_at = 0.0
+
+
+def holidays_from(rows):
+    """證交所的休市日曆（民國年 1150925）→ 西元 YYYYMMDD。名稱有「交易日」的是開始／最後交易日，照常交易；
+    「市場無交易，僅辦理結算交割作業」這種沒有盤，算休市。"""
+    return {str(int(r["Date"][:3]) + 1911) + r["Date"][3:] for r in rows
+            if "交易日" not in r.get("Name", "") and len(r.get("Date", "")) == 7}
+
+
+def load_holidays():
+    global holiday_at
+    try:
+        ctx = ssl.create_default_context()
+        ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
+        req = urllib.request.Request(HOLIDAY_URL, headers={"User-Agent": "Mozilla/5.0"})
+        days = holidays_from(json.load(urllib.request.urlopen(req, timeout=20, context=ctx)))
+        if days:
+            tw_holidays.clear()
+            tw_holidays.update(days)
+    except Exception:
+        pass  # 抓不到就沿用上次的；第一次就失敗則當成沒有假日（跟以前一樣）
+    holiday_at = time.time()
+
+
+def tw_closed(day=None):
+    """台股今天（或指定那天 YYYYMMDD）休市。"""
+    return (day or time.strftime("%Y%m%d")) in tw_holidays
+
+
+def us_open(when=None):
+    """美股開盤（紐約 09:30）換成台灣時間是幾點幾分（分鐘數）：夏令時間 21:30（1290）、冬令時間 22:30（1350）。"""
+    ny = (when or datetime.now(ZoneInfo("America/New_York"))).astimezone(ZoneInfo("America/New_York"))
+    tw = ny.replace(hour=9, minute=30, second=0, microsecond=0).astimezone(ZoneInfo("Asia/Taipei"))
+    return tw.hour * 60 + tw.minute
+
+
+# ── Yahoo 批次查價 ──
+YAHOO_QUOTE = "https://query1.finance.yahoo.com/v7/finance/quote"
+YAHOO_BATCH = 50
+
+
+def fetch_yahoo(syms):
+    """一次問一批（YAHOO_BATCH 檔一個請求），不再一檔一檔問：一輪從上百個請求變成兩個，比較不會被限流。
+    回傳 {代號: 報價}；沒拿到的由呼叫端改問 CNBC，不退回一檔一檔問（那樣只會更容易被限流）。"""
+    got, api = {}, yf.data.YfData()
+    for i in range(0, len(syms), YAHOO_BATCH):
+        try:
+            r = api.get_raw_json(YAHOO_QUOTE, params={"symbols": ",".join(syms[i:i + YAHOO_BATCH])})
+        except Exception as e:
+            note_src("Yahoo", False, type(e).__name__)
+            continue
+        for x in r.get("quoteResponse", {}).get("result", []):
+            price, prev = x.get("regularMarketPrice"), x.get("regularMarketPreviousClose")
+            if price is None or not prev:
+                continue
+            got[x["symbol"]] = (price, prev, x.get("regularMarketVolume"), x.get("averageDailyVolume10Day"),
+                                x.get("regularMarketDayLow") or price, x.get("regularMarketDayHigh") or price)
+        note_src("Yahoo", True)
+    return got
+
+
 def fetch_taifex(prefix):
     """期交所近月合約：日盤 08:45-13:45 抓一般盤，其餘時間抓夜盤。"""
     now = time.localtime()
@@ -453,8 +551,9 @@ def fetch(sym):
     if sym in FUTURES:
         try:
             fetch_taifex(sym)
-        except Exception:
-            pass
+            note_src("期交所", True)
+        except Exception as e:
+            note_src("期交所", False, type(e).__name__)
         return
     q = quotes.get(sym, ())
     if (sym == "^TWII" or sym.endswith((".TW", ".TWO"))) and len(q) > 3 and q[3]:
@@ -467,9 +566,14 @@ def fetch(sym):
         pass  # 保留舊值，下輪再試
 
 
-# 各市場現貨交易時段（台灣時間，開盤分鐘數, 時長分鐘數）；總經、期貨沒有量比
-# ponytail: 不管日股午休、美股夏令時間與假日，量比在這些時段會略偏
+# 各市場現貨交易時段（台灣時間，開盤分鐘數, 時長分鐘數）；總經、期貨沒有量比。美股開盤時間看夏令時間（window()）
+# ponytail: 不管日股午休、美日韓的國定假日（台股看證交所休市日曆），那些日子量比會略偏、列會變暗
 SESSIONS = {".TW": (540, 270), ".TWO": (540, 270), ".T": (480, 390), ".KS": (480, 390), "US": (1290, 390)}
+
+
+def window(suffix):
+    """(開盤分鐘數, 時長)：美股依夏令時間算，其他照 SESSIONS。"""
+    return (us_open(), 390) if suffix == "US" else SESSIONS[suffix]
 VOL_HOT, VOL_LOW = 2.0, 0.5   # 量比 ≥ VOL_HOT 爆量標亮，≤ VOL_LOW 量縮變暗
 VOL_WARMUP = 15               # 開盤後前幾分鐘量比失真，先不標亮
 
@@ -484,10 +588,10 @@ def volume_ratio(sym, vol, avg):
     suffix = suffix_of(sym)
     if suffix not in SESSIONS or not vol or not avg:
         return "", ""
-    start, length = SESSIONS[suffix]
+    start, length = window(suffix)
     now = time.localtime()
     since = (now.tm_hour * 60 + now.tm_min - start) % 1440
-    trading = since < length and now.tm_wday < 5
+    trading = since < length and now.tm_wday < 5 and not (suffix in (".TW", ".TWO") and tw_closed())
     ratio = vol / (avg * (max(since, 1) / length if trading else 1))  # 盤外 lastVolume 是整日量，不用換算
     if ratio >= VOL_HOT and not (trading and since < VOL_WARMUP):
         style = VOL_HOT_STYLE
@@ -508,7 +612,9 @@ def session_open(sym):
     suffix = suffix_of(sym)
     if suffix not in SESSIONS:
         return True
-    start, length = SESSIONS[suffix]
+    if suffix in (".TW", ".TWO") and tw_closed():
+        return False  # 證交所公布的休市日（颱風假臨時停市不在日曆上）
+    start, length = window(suffix)
     now = time.localtime()
     since = (now.tm_hour * 60 + now.tm_min - start) % 1440
     opened = time.localtime(time.time() - since * 60)  # 美股跨午夜，要看開盤那天是不是平日
@@ -557,16 +663,26 @@ def poller():
             # 收盤的市場價格不會再動，跳過可以少掉夜裡大半的請求，免得被 Yahoo 限流。
             # 還沒抓到過的照抓，不然剛開面板時收盤市場會整片空白
             syms = [s for s in syms if s not in FUTURES and (s in RATES or session_open(s) or s not in quotes)]
-            list(pool.map(fetch, syms))  # 台股、台指期交給 tw_poller
+            if time.time() - holiday_at > 86400:
+                load_holidays()  # 一天更新一次休市日曆
+            tw = lambda s: s == "^TWII" or s.endswith((".TW", ".TWO"))
+            # 台股即時價由 tw_poller 抓證交所；Yahoo 只補一次 10 日均量（量比要用）
+            yahoo = [s for s in syms if s not in RATES and s not in SECTOR_SET
+                     and not (tw(s) and len(quotes.get(s, ())) > 3 and quotes[s][3])]
+            list(pool.map(fetch, [s for s in syms if s in RATES]))  # 央行利率各有各的網站
             batch = dict(staged)
             staged.clear()
+            for s, q in fetch_yahoo(yahoo).items():
+                old = quotes.get(s, ())
+                batch[s] = (*old[:3], q[3], *old[4:]) if tw(s) and len(old) == 6 else q  # 台股只拿均量，價格留證交所的
             publish(batch)  # 整圈都回來了才一次寫進去，這一圈的報價在同一幀一起跳
-            missing = [s for s in syms if s not in quotes]  # 多半是 Yahoo 限流，整批空手而回
-            if missing:
+            failed = [s for s in yahoo if s not in batch and not tw(s)]  # Yahoo 被限流：整批改問 CNBC，不一檔一檔重試
+            if failed:
                 try:
-                    fetch_cnbc(missing)
-                except Exception:
-                    pass  # 備援也連不上就維持空白，下輪再試
+                    fetch_cnbc(failed)
+                    note_src("CNBC", True)
+                except Exception as e:
+                    note_src("CNBC", False, type(e).__name__)  # 備援也連不上就維持舊值，下輪再試
             try:
                 fetch_sectors()
             except Exception:
@@ -593,10 +709,11 @@ def poller():
 
 
 def futures_open():
-    """台指期日盤 08:45-13:45、夜盤 15:00-隔天 05:00。"""
-    # ponytail: 不管國定假日，放假那幾天會多抓幾次期交所，無害
+    """台指期日盤 08:45-13:45、夜盤 15:00-隔天 05:00。台股休市那天日盤、夜盤都沒有（凌晨是前一天夜盤的尾巴，照開）。"""
     now = time.localtime()
     hm = now.tm_hour * 100 + now.tm_min
+    if tw_closed() and hm > 500:
+        return False
     return (now.tm_wday < 5 and (845 <= hm <= 1345 or hm >= 1500)) or (0 < now.tm_wday < 6 and hm <= 500)
 
 
@@ -609,8 +726,9 @@ def tw_poller():
             twse_at = time.time()
             try:
                 fetch_twse([s for rows in [INDICES, *PAGES.values(), extra_items()] for s, _ in rows if s])
-            except Exception:
-                pass  # 證交所連不上就先用 Yahoo 的延遲價
+                note_src("證交所", True)
+            except Exception as e:
+                note_src("證交所", False, type(e).__name__)  # 連不上就先用 Yahoo 的延遲價
             if time.time() - saved_at >= FLOW_SAVE_SEC:  # 不限盤中：13:30 收盤那筆常在盤後才進來
                 saved_at = time.time()
                 save_flow()
@@ -1079,6 +1197,7 @@ def fugle_worker():
             if q:
                 quotes[sym] = (last, q[1], q[2], q[3] if len(q) > 3 else None, d["lowPrice"], d["highPrice"])
             fugle_at[sym] = time.time()
+            note_src("富果", True)
             tot = d.get("total") or {}
             if tot.get("tradeVolumeAtAsk") is not None:  # 富果給的是逐筆算好的真實內外盤，而且從開盤累計
                 flow_exact[sym] = (d["date"].replace("-", ""), tot["tradeVolumeAtAsk"], tot.get("tradeVolumeAtBid") or 0)
@@ -1706,6 +1825,7 @@ def clip_cells(t, start, width):
     return out
 
 
+SRC_COLOR = {"ok": "#66bb6a", "old": "#ffca28", "err": "#ef5350", "idle": "#50535e"}
 FOOTER_LINES = 2  # 底部固定兩行：快捷鍵提示列、跑馬燈。表格與 K 線能用的高度要先扣掉
 KEY = "bold #d1d4dc on #2a2e39"  # 快捷鍵鍵帽：比底色亮一階的方塊，說明文字用灰字
 
@@ -1716,6 +1836,9 @@ def fkeys():
     for k, label in ((f"1-{len(PAGES)}", "分頁"), ("←→", "換頁"), ("↑↓", "選股"), ("點擊", "看 K 線"),
                      ("空白", "繼續輪動" if paused else "暫停輪動"), ("+−", "K 線縮放"), ("q", "離開")):
         t.append(f" {k} ", KEY).append(f" {label}    ", SYMBOL)
+    t.append(" 資料 ", SYMBOL)
+    for name, status, _ in sources():  # 綠＝正常、黃＝該有資料卻停了、紅＝上一次失敗、灰＝還沒抓
+        t.append("●", SRC_COLOR[status]).append(f"{name}  ", SYMBOL)
     return t
 
 
