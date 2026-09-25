@@ -1,4 +1,5 @@
 """終端機行情面板：頂部大盤固定，下方個股每 AUTO_SEC 秒自動翻頁；←/→ 或數字鍵手動切頁，空白鍵暫停翻頁，q 離開。資料源 Yahoo Finance（免費，部分市場有延遲）。"""
+import gc
 import io
 import re
 import json
@@ -172,21 +173,23 @@ REFRESH_SEC, IDLE_SEC = 15, 60  # 國際報價（Yahoo）盤中／盤後輪詢�
 # 台股與台指期另開一條快迴圈，不跟 Yahoo 那一圈排隊。MIS 本身約 5 秒才更新一次快照，再快也拿不到新價，
 # 太密還會被證交所暫時封 IP。ponytail: 5 秒快照是免費來源的極限，要逐筆就換富果/Shioaji WebSocket（要券商帳號）
 TW_SEC = 5
-UP, DOWN = "bold #ff3b3b", "bold #00e676"  # 台灣習慣紅漲綠跌，美式就對調
-FLAT, NAME, SYMBOL, HEADER, TAB = "#b0b0b0", "bold #ffffff", "#8a8a8a", "bold #4dd0ff", "bold #000000 on #4dd0ff"
-RULE = "#3a3a3a"  # 表頭下方細線顏色
-SEL, SEL_MARK = "on #1f3346", "bold #4dd0ff"  # 選中那一列：暗藍底加左邊一條亮藍線，右邊 K 線就是這一檔
-RULE_BAR = "#4a4a4a"  # 今日區間條的線
+# 配色取自 TradingView 深色主題：深藍灰底、降飽和的紅與青綠，長時間盯盤不刺眼
+BG, FG = "#131722", "#d1d4dc"  # 開面板時用 OSC 11/10 換掉這個窗格的預設底色與字色，離開時還原
+UP, DOWN = "bold #ef5350", "bold #26a69a"  # 台灣習慣紅漲綠跌，美式就對調
+FLAT, NAME, SYMBOL, HEADER, TAB = "#9598a1", "bold #e8eaef", "#787b86", "#787b86", "bold #ffffff on #2962ff"
+RULE = "#2a2e39"  # 表頭下方細線顏色
+SEL, SEL_MARK = "on #1e2a4a", "bold #2962ff"  # 選中那一列：暗藍底加左邊一條亮藍線，右邊 K 線就是這一檔
+RULE_BAR = "#363a45"  # 今日區間條的線
 # 今日區間條風格：grad 漸層填色（預設，帶量價對比）/ dash 線加 ● / track 點線 / fill 實心
 # / light 細底線 / tick 兩端界線
 RANGE_STYLE = "grad"
 # grad 的量價配色：爆量用亮色，量縮轉暗，價方向決定紅綠
-HOT_OF = {"bold #ff3b3b": "#ff1744", "bold #00e676": "#00ff88"}
-DIM_OF = {"bold #ff3b3b": "#7a2020", "bold #00e676": "#1a6640", "#b0b0b0": "#4a4a4a"}
-VOL_HOT_STYLE, VOL_LOW_STYLE = "bold #ffd54f", "#555555"  # 爆量用亮黃字；底色只留給警示與跳價閃燈，其他訊號同時亮才不會一片花
-TICK_UP, TICK_DOWN = "bold #000000 on #ff3b3b", "bold #000000 on #00e676"  # 價格跳動時整格亮一下，顏色跟漲跌一致
+HOT_OF = {UP: "#ff6f6c", DOWN: "#3fd1c2"}
+DIM_OF = {UP: "#6e2a2d", DOWN: "#1c5a55", FLAT: "#4a4e59"}
+VOL_HOT_STYLE, VOL_LOW_STYLE = "bold #ffca28", "#50535e"  # 爆量用亮黃字；底色只留給警示與跳價閃燈，其他訊號同時亮才不會一片花
+TICK_UP, TICK_DOWN = "bold #ffffff on #ef5350", "bold #ffffff on #26a69a"  # 價格跳動時整格亮一下，顏色跟漲跌一致
 TICK_SEC = 0.8  # 亮燈持續秒數；主迴圈 20fps 重繪，這段時間內都看得到
-FLIPPING = "bold #d0d0d0"  # 翻牌中的字用亮灰，翻的時候看得出在動、又不搶漲跌色的戲
+FLIPPING = "bold #b2b5be"  # 翻牌中的字用亮灰，翻的時候看得出在動、又不搶漲跌色的戲
 # 翻牌：列延遲 ROW_DELAY、字延遲 CHAR_DELAY、字輪每格 STEP_SEC、最多翻 MAX_STEPS 格
 ROW_DELAY, CHAR_DELAY, STEP_SEC, MAX_STEPS = 0.05, 0.02, 0.035, 18
 FLIP_SEC = 2.0            # 須 ≥ 列數×ROW_DELAY + 字數×CHAR_DELAY + MAX_STEPS×STEP_SEC
@@ -209,8 +212,8 @@ INDEX_SWAP_SEC = 4        # 大盤第二行在幅度 / 漲跌點數之間輪流�
 # 位階：現價對 20 日均線的乖離率，加 52 週位置。日線一天抓一次，寫成檔案，重開面板不用重抓
 DAILY_FILE = Path(__file__).with_name("daily.json")
 DEV_HIGH, DEV_LOW = 0.08, -0.08       # 乖離率超過 ±8% 就標追高／回檔
-DEV_HOT = "bold #ff8f00"   # 追高用橘字，跟爆量的黃字、漲跌的紅綠都分得開
-DEV_COLD = "bold #26c6da"  # 回檔用青字
+DEV_HOT = "bold #ff9800"   # 追高用橘字，跟爆量的黃字、漲跌的紅綠都分得開
+DEV_COLD = "bold #42a5f5"  # 回檔用藍字
 POS_HOT, POS_COLD = 90, 10            # 52 週位置的高低帶，超過就上色
 # 籌碼：外資買賣超連續天數。證交所 T86 收盤後才更新，一小時抓一次就夠
 DAILY_BATCH, DAILY_GAP = 25, 2.0   # 日線分批下載的批量與批間隔，一次全丟會被擋
@@ -228,11 +231,11 @@ SECTOR_SET = {f"{c}.TW" for c in SECTOR_CODES}  # 這些只走 MIS，不進 yfin
 # 警示：到價與爆量。規則放 portfolio.json 的「警示」，每天每條只響一次
 ALERT_SEC = 300       # 訊息在跑馬燈上留多久
 VOL_ALERT = 3.0       # 量比超過這個倍數就自動報一次
-ALERT_STYLE = "bold #000000 on #ff3b3b"
+ALERT_STYLE = "bold #ffffff on #ef5350"
 
 quote_at = {}  # symbol -> 最後一次寫進報價的時間，判斷過期用
 STALE_SEC = 90  # 盤中超過這麼久沒拿到新報價就整列變暗；Yahoo 一輪 15 秒，等於連掉六輪
-STALE = "#555555"
+STALE = "#4a4e59"
 
 
 frame_lock = threading.Lock()  # 組一幀畫面時拿著；整批報價寫入也要拿。一幀裡看到的一定是同一批資料
@@ -1019,11 +1022,11 @@ KPANEL_FIXED = 4 + PAT_MAX + VOL_ROWS  # K 線圖以外固定佔幾行：標題�
 MA_GAP = 5            # 均線列各項之間空幾格
 # 均線軌跡：(天數, 標籤, 顏色)。月線紫、季線淺藍、半年線橘，跟紅綠 K 棒都分得開。
 # 疊在同一格時先畫的贏，所以短的排前面
-MA_LINES = ((20, "月線", "#b388ff"), (60, "季線", "#4fc3f7"), (120, "半年", "#ffb74d"))
-VOL_UP, VOL_DOWN = "#c62828", "#00a152"  # 量柱比 K 棒暗一階，才不會搶戲
+MA_LINES = ((20, "月線", "#ab47bc"), (60, "季線", "#42a5f5"), (120, "半年", "#ff9800"))
+VOL_UP, VOL_DOWN = "#8c3436", "#1f6e67"  # 量柱比 K 棒暗一階，才不會搶戲
 VOL_BLOCKS = " ▁▂▃▄▅▆▇█"
 ZOOMS = ((2, 1), (1, 1), (3, 2))  # (每根佔幾格, 棒身幾格)，+ / - 切換
-BAR_UP, BAR_MID, BAR_DOWN = "bold #ff3b3b", "#c62828", "bold #00e676"  # 站上季線／只站上月線／跌破月線
+BAR_UP, BAR_MID, BAR_DOWN = UP, "#b23c3a", DOWN  # 站上季線／只站上月線／跌破月線
 # 上下半格字元：一格塞兩個價格層級，垂直解析度就是行數的兩倍
 CELLS = {0: " ", 1: "╵", 2: "╷", 3: "│", 4: "▀", 5: "▀", 6: "▀", 7: "▀",
          8: "▄", 9: "▄", 10: "▄", 11: "▄", 12: "█", 13: "█", 14: "█", 15: "█"}
@@ -1520,7 +1523,7 @@ def index_bar():
         if len(chg) > 7:
             chg = chg.rsplit(".", 1)[0]
         label = f"[{SEL_MARK} {SEL}]{name}[/]" if sym == sel_sym else f"[{NAME}]{name}[/]"  # 右邊 K 線正在看這個大盤
-        cells.append(f"{label} [#e0e0e0]{price}[/]\n[{color or SYMBOL}]{(chg if show_chg else pct) or '…'}[/]")
+        cells.append(f"{label} [{FG}]{price}[/]\n[{color or SYMBOL}]{(chg if show_chg else pct) or '…'}[/]")
     bar.add_row(*cells)
     return bar
 
@@ -1688,6 +1691,19 @@ def clip_cells(t, start, width):
     return out
 
 
+FOOTER_LINES = 2  # 底部固定兩行：快捷鍵提示列、跑馬燈。表格與 K 線能用的高度要先扣掉
+KEY = "bold #d1d4dc on #2a2e39"  # 快捷鍵鍵帽：比底色亮一階的方塊，說明文字用灰字
+
+
+def fkeys():
+    """Bloomberg 那種底部功能鍵列：按鍵反白、說明灰字。空白鍵的說明跟著暫停狀態換。"""
+    t = Text(" ")
+    for k, label in ((f"1-{len(PAGES)}", "分頁"), ("←→", "換頁"), ("↑↓", "選股"), ("點擊", "看 K 線"),
+                     ("空白", "繼續輪動" if paused else "暫停輪動"), ("+−", "K 線縮放"), ("q", "離開")):
+        t.append(f" {k} ", KEY).append(f" {label}    ", SYMBOL)
+    return t
+
+
 def marquee(width):
     """組一整行：固定段 + 捲動段，總寬剛好 width。"""
     head = alert_text()
@@ -1722,11 +1738,17 @@ def draw(console, renderable):
     不用 rich Live：alt screen 從 hook／重開窗格時偶爾整片空白；原地模式滿高時每次重畫都會往下捲。"""
     global bell
     width, height = console.size
-    height -= 1  # 底部留一行：每行都剛好滿寬，寫進右下角那一格終端機就捲一行（畫面上下抖動）
+    # 底部兩行固定：快捷鍵列、跑馬燈。跑馬燈那行不寫滿，寫進右下角那一格終端機就捲一行（畫面上下抖動）
+    height -= FOOTER_LINES
     buf = Console(file=io.StringIO(), width=width, height=height, force_terminal=True,
                   color_system="truecolor", legacy_windows=False, no_color=False)
     buf.print(renderable, crop=True)
     lines = buf.file.getvalue().split("\n")[:height]
+    lines += [""] * (height - len(lines))  # 補滿：換到比較短的頁面時，下面那幾行舊字也要清掉
+    buf = Console(file=io.StringIO(), width=width, force_terminal=True,
+                  color_system="truecolor", legacy_windows=False, no_color=False)
+    buf.print(fkeys(), end="", crop=True, no_wrap=True)
+    lines.append(buf.file.getvalue())  # 快捷鍵列當成最後一行，一起比對、沒變就不重送
     screen[:] = [ANSI.sub("", line) for line in lines]
     # \x1b[?2026h/l：同步更新，終端機等整幀寫完才換上，不會畫一半就顯示（撕裂）
     bar = Console(file=io.StringIO(), width=width, force_terminal=True,
@@ -1742,7 +1764,7 @@ def draw(console, renderable):
                   if full or i >= len(drawn) or drawn[i] != line)
     drawn[:] = lines
     console.file.write("\x1b[?2026h" + ("\x1b[2J" if full else "") + out
-                       + f"\x1b[{height + 1};1H" + bar.file.getvalue() + "\x1b[0m\x1b[K"
+                       + f"\x1b[{height + FOOTER_LINES};1H" + bar.file.getvalue() + "\x1b[0m\x1b[K"
                        + "\x1b[?2026l")
     if bell:
         console.file.write(chr(7))  # 終端機響一聲，沒盯著面板也知道有警示
@@ -1776,6 +1798,11 @@ def main():
     load_daily()
     load_chips()
     load_flow()
+    # 垃圾回收調整：rich 每幀產生幾萬個暫時物件，預設門檻下每隔幾秒就有一次完整回收剛好落在某一幀，
+    # 那幀從 13ms 拖到 40ms 以上（實測偶爾掉一幀）。載入完的日線、設定是長壽物件，freeze 移出回收範圍；
+    # 第 0 代門檻調高，少掃幾次。實測 12 秒：最慢一幀 42→18ms、掉幀 1→0
+    gc.freeze()
+    gc.set_threshold(50000, 50, 100)
     threading.Thread(target=poller, daemon=True).start()
     threading.Thread(target=tw_poller, daemon=True).start()
     threading.Thread(target=fugle_worker, daemon=True).start()
@@ -1793,6 +1820,9 @@ def main():
     code_at = Path(__file__).stat().st_mtime
     enable_mouse()
     pending = None  # 翻牌動畫中收到的按鍵／點擊，動畫中斷後馬上處理
+    # OSC 11/10 把這個窗格的預設底色、字色換成配色裡的 BG/FG：清行（\x1b[K）、留白都會是這個底色，
+    # 不用每一格自己塗。只影響面板這個窗格，下面 Claude Code 那格不受影響
+    console.file.write(f"\x1b]11;{BG}\x1b\\\x1b]10;{FG}\x1b\\")
     console.file.write("\x1b[2J\x1b[?25l")  # 清畫面、藏游標
     try:
         while True:
@@ -1804,7 +1834,7 @@ def main():
             panel_w = min(KPANEL_MAX, console.width - COL_W - 2)
             if panel_w < KPANEL_MIN:
                 panel_w = 0  # 窗格太窄就整個收起來，只留表格
-            names = views_for(console.height - 1, console.width - panel_w)
+            names = views_for(console.height - FOOTER_LINES, console.width - panel_w)
             idx %= len(names)
             key, pending = pending or read_key(), None
             new = idx
@@ -1845,16 +1875,17 @@ def main():
                 speed = FLIP_FAST if key else 1  # 自己點的換頁動畫加快；自動輪動照原本的節奏慢慢翻
                 t0 = time.time()
                 while (t := (time.time() - t0) * speed) < FLIP_SEC:
-                    draw(console, compose(names[idx], old_rows, t, panel_w, console.height - 1))
+                    draw(console, compose(names[idx], old_rows, t, panel_w, console.height - FOOTER_LINES))
                     wait_input(1 / 30)
                     if pending := read_key():  # 翻牌中又點了別頁：不等動畫跑完，直接換
                         break
                 shown = time.time()
             if not pending:
-                draw(console, compose(names[idx], panel_w=panel_w, height=console.height - 1))
+                draw(console, compose(names[idx], panel_w=panel_w, height=console.height - FOOTER_LINES))
                 wait_input(FRAME_SEC - time.time() % FRAME_SEC)  # 睡到下一個幀邊界，跑馬燈才勻速；有點擊就提早醒
     finally:
         console.file.write("\x1b[?25h\x1b[?1000l\x1b[?1006l")  # q 離開時把游標、滑鼠還回來
+        console.file.write("\x1b]111\x1b\\\x1b]110\x1b\\")  # 底色、字色還原成終端機設定檔的
 
 
 if __name__ == "__main__":

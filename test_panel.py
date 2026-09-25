@@ -264,6 +264,22 @@ def demo():
     assert m.clicked_row(10, 1, [("2330.TW", "x"), ("12330.TW", "甲")]) == "12330.TW", "2330.TW 不能撞到 12330.TW"
     assert m.clicked_row(25, 1, [("6488.TW", "x"), ("6488.TWO", "乙")]) == "6488.TWO", "6488.TW 不能撞到 6488.TWO"
 
+    # 換到比較短的頁面：下面多出來的舊行要清掉，不能留著上一頁的字
+    Con.size = (60, 8)
+    m.draw(Con, frame("a", "b", "c", "d")); n = sent()
+    m.draw(Con, frame("a", "b"))
+    assert "\x1b[3;1H\x1b[0m\x1b[K" in Con.file.getvalue()[n:], "第 3 行的舊字要清掉"
+    # 快捷鍵列固定在倒數第二行，空白鍵的說明跟著暫停狀態換
+    m.paused = False
+    assert "暫停輪動" in m.fkeys().plain and f"1-{len(m.PAGES)}" in m.fkeys().plain
+    m.paused = True
+    assert "繼續輪動" in m.fkeys().plain
+    m.paused = False
+    assert len(m.screen) == 8 - 1 and m.screen[-1].strip().startswith(f"1-{len(m.PAGES)}"), \
+        "8 行高的窗格：內容 6 行 + 快捷鍵列（倒數第二行），最後一行是跑馬燈"
+    Con.size = (50, 6)
+    m.draw(Con, frame("a", "X", "c"))  # 還原成下面那段用的窗格大小
+
     # 定時整頁重畫：畫面被弄亂最多亂 FULL_SEC 秒
     Con.size = (50, 6)
     n = sent(); m.draw(Con, frame("a", "X", "c"))
