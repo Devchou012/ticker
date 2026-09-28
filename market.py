@@ -9,7 +9,7 @@ import time
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -339,6 +339,10 @@ def fetch_taifex(prefix):
     price = float(near["CLastPrice"] or 0)
     if price:  # 還沒成交就保留舊值
         quotes[prefix] = (price, float(near["CRefPrice"]))
+        if not day:  # 盤前預估只看夜盤；15:00 夜盤還沒成交前 quotes 裡還是日盤的價，不能拿來算
+            night[prefix] = (price, float(near["CRefPrice"]), time.time())
+        else:  # 08:45 日盤開盤後，盤前預估改看日盤；期交所日期不是今天就是昨天的舊價，不能用
+            day_quote[prefix] = (price, float(near["CRefPrice"]), near.get("CDate", ""))
 
 
 TWSE_MIS = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch="
@@ -573,7 +577,8 @@ def poller():
     with ThreadPoolExecutor(8, thread_name_prefix=STAGE) as pool:  # 這些執行緒的寫入會先進 staged
         while True:
             # s 是 None 的是產業分組標題；extra_items 是網頁版各裝置「我的清單」裡的股票
-            syms = list(dict.fromkeys(s for rows in [INDICES, *PAGES.values(), extra_items()] for s, _ in rows if s))
+            syms = list(dict.fromkeys(s for rows in [INDICES, *PAGES.values(), extra_items(), PREOPEN_ITEMS]
+                                      for s, _ in rows if s))
             # 收盤的市場價格不會再動，跳過可以少掉夜裡大半的請求，免得被 Yahoo 限流。
             # 還沒抓到過的照抓，不然剛開面板時收盤市場會整片空白
             syms = [s for s in syms if s not in FUTURES and (s in RATES or session_open(s) or s not in quotes)]
@@ -611,6 +616,9 @@ def poller():
                 # 新加進清單、或昨天那批被擋掉的，不要等到盤後：只補這幾檔
                 miss_at = time.time()
                 threading.Thread(target=daily_worker, args=(miss,), daemon=True).start()
+            if not preopen_busy and preopen_fit.get("date") != time.strftime("%Y%m%d") and \
+                    time.time() - preopen_try >= PREOPEN_RETRY:
+                threading.Thread(target=update_preopen, daemon=True).start()
             if time.time() - chips_at >= CHIP_SEC:
                 try:
                     fetch_chips()
@@ -639,7 +647,7 @@ def tw_poller():
         if session_open("x.TW") or time.time() - twse_at >= IDLE_SEC:
             twse_at = time.time()
             try:
-                fetch_twse([s for rows in [INDICES, *PAGES.values(), extra_items()] for s, _ in rows if s])
+                fetch_twse([s for rows in [INDICES, *PAGES.values(), extra_items(), PREOPEN_ITEMS] for s, _ in rows if s])
                 note_src("證交所", True)
             except Exception as e:
                 note_src("證交所", False, type(e).__name__)  # 連不上就先用 Yahoo 的延遲價
@@ -961,3 +969,133 @@ def volumes(sym):
 def extra_items():
     """網頁版各裝置「我的清單」裡的股票，輪詢與補日線也要抓。網頁版載入時會換掉這個函式；沒裝就是空的。"""
     return []
+
+
+# ── 盤前預估：用台指期夜盤預估加權指數開盤漲跌幅 ──
+# 回測（ticker-web/research/preopen.py，2017-05～2026-09、2,281 天）：夜盤漲跌 × 係數就夠，
+# 加上 ADR、EWT 誤差只再少 0.01～0.02%，所以它們只列出來參考。證交所 09:00 的開盤指數裡還沒成交的股票用昨收，
+# 開盤漲跌天生比夜盤小，係數約 0.2～0.9；2025-12 前後從 0.7～0.9 掉到 0.2～0.4（原因未查證），
+# 固定係數在 2026 年誤差 0.46%，每天用最近 40 天重算只有 0.28%，所以滾動重算。
+# 08:45 台指期日盤開盤後改用日盤價（research/preopen_asia.py）：2023 年後平均誤差 0.27%→0.22%、方向 89%→94%。
+# 日經、KOSPI 08:00 的開盤跳空加進去沒有幫助（0.270%→0.265～0.271%），不放。
+PREOPEN_FILE = Path(__file__).with_name("preopen.json")
+PREOPEN_DAYS = 40     # 係數用最近幾個交易日
+PREOPEN_MONTHS = 6    # 抓幾個月：前 40 天算第一個係數，其餘每天的預估拿來算誤差範圍與過去成績
+PREOPEN_BAND = 0.9    # 誤差範圍：過去的預估有九成落在這個範圍內
+PREOPEN_RETRY = 1800  # 抓失敗多久再試
+# 台灣 ADR：(美股代號, 台股代號, 一股 ADR 換幾股台股)。只列出來參考，不進預估
+ADRS = [("TSM", "2330.TW", 5), ("UMC", "2303.TW", 5), ("ASX", "3711.TW", 2)]
+PREOPEN_ITEMS = [("TSM", "台積電 ADR"), ("UMC", "聯電 ADR"), ("ASX", "日月光 ADR"),
+                 ("2330.TW", "台積電"), ("2303.TW", "聯電"), ("3711.TW", "日月光投控"), ("TWD=X", "美元/台幣")]
+
+night = {}           # 期貨代號 -> (夜盤價, 參考價＝前一日盤結算價, 抓到的時間)
+day_quote = {}       # 期貨代號 -> (日盤價, 參考價＝前一日盤結算價, 期交所日期 YYYYMMDD)
+# {"date": 算的那天, "night": 夜盤那組, "open": 08:45 日盤那組}；每組 {"beta", "band", "days", "recent", "mae", "hit", "n"}
+preopen_fit = {}
+preopen_busy = False
+preopen_try = 0.0
+
+
+def taifex_month(first, last):
+    """期交所「期貨每日交易行情」TX，一次最多一個月。回傳 [(日期 YYYYMMDD, 合約, 時段, 收盤, 結算, 成交量)]。
+    盤後那列的日期是歸屬日：7/4 的盤後＝7/3 15:00～7/4 05:00，正好在 7/4 開盤前。"""
+    body = urllib.parse.urlencode({"down_type": 1, "commodity_id": "TX", "queryStartDate": first,
+                                   "queryEndDate": last}).encode()
+    ctx = ssl.create_default_context()
+    ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
+    req = urllib.request.Request("https://www.taifex.com.tw/cht/3/futDataDown", data=body,
+                                 headers={"User-Agent": "Mozilla/5.0"})
+    text = urllib.request.urlopen(req, timeout=30, context=ctx).read().decode("big5", errors="replace")
+    return parse_taifex(text)
+
+
+def parse_taifex(text):
+    val = lambda x: float(x) if x.strip() not in ("", "-") else None
+    out = []
+    for line in text.splitlines()[1:]:
+        f = line.split(",")
+        if len(f) < 18 or "/" in f[2]:  # 價差單的到期月份是「202608/202609」
+            continue
+        out.append((f[0].replace("/", ""), f[2].strip(), f[17].strip(), val(f[3]), val(f[6]), val(f[10]), val(f[9]) or 0))
+    return out
+
+
+def twse_month(yyyymm01):
+    """證交所「發行量加權股價指數歷史資料」一個月：{日期 YYYYMMDD: (開盤, 收盤)}。"""
+    ctx = ssl.create_default_context()
+    ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
+    url = f"https://www.twse.com.tw/rwd/zh/TAIEX/MI_5MINS_HIST?date={yyyymm01}&response=json"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    out = {}
+    for d, o, _, _, c in json.load(urllib.request.urlopen(req, timeout=30, context=ctx)).get("data", []):
+        y, m, day = d.split("/")
+        out[f"{int(y) + 1911}{m}{day}"] = (float(o.replace(",", "")), float(c.replace(",", "")))
+    return out
+
+
+def preopen_pairs(tx, ix, stage="night"):
+    """每個交易日一組 (日期, 台指期漲跌, 開盤漲跌)。台指期漲跌以近月（成交量最大）合約、比同一合約前一天日盤結算，
+    跟即時報價的參考價同一個基準：stage="night" 用夜盤收盤（05:00），"open" 用日盤開盤（08:45）。
+    開盤漲跌＝證交所開盤指數 ÷ 前一天收盤 − 1。"""
+    want, settle = {}, {}
+    for d, contract, session, opn, close, stl, vol in tx:
+        px = close if stage == "night" else opn
+        if session == ("盤後" if stage == "night" else "一般") and px and vol >= want.get(d, (0, 0, 0))[2]:
+            want[d] = (contract, px, vol)
+        if session == "一般" and stl:
+            settle[(d, contract)] = stl
+    days, out = sorted(ix), []
+    for prev, d in zip(days, days[1:]):
+        if d in want and (base := settle.get((prev, want[d][0]))):
+            out.append((d, want[d][1] / base - 1, ix[d][0] / ix[prev][1] - 1))
+    return out
+
+
+def fit_preopen(pairs, days=PREOPEN_DAYS):
+    """滾動係數（過零點最小平方）：每天只用那天以前的 days 天。回傳今天要用的係數、過去每天預估的誤差範圍與成績。"""
+    if len(pairs) < days + 5:
+        return {}
+    beta = lambda rows: sum(x * y for _, x, y in rows) / (sum(x * x for _, x, _ in rows) or 1)
+    recent = [[d, beta(pairs[i - days:i]) * x, y] for i, (d, x, y) in enumerate(pairs) if i >= days]
+    errs = sorted(abs(e - y) for _, e, y in recent)
+    moved = [(e, y) for _, e, y in recent if abs(y) > 0.001]  # 平盤附近不算方向
+    return {"beta": beta(pairs[-days:]), "band": errs[min(len(errs) - 1, int(len(errs) * PREOPEN_BAND))],
+            "mae": sum(errs) / len(errs), "hit": sum((e > 0) == (y > 0) for e, y in moved) / max(len(moved), 1),
+            "n": len(recent), "days": days, "recent": recent[-10:]}
+
+
+def update_preopen():
+    """一天一次：抓最近 PREOPEN_MONTHS 個月的期交所日行情與證交所開收盤，重算係數，存檔（重開面板不用重抓）。"""
+    global preopen_busy, preopen_try
+    preopen_busy, preopen_try = True, time.time()
+    try:
+        tx, ix, today = [], {}, datetime.now()
+        for k in range(PREOPEN_MONTHS - 1, -1, -1):
+            y, m = divmod(today.year * 12 + today.month - 1 - k, 12)
+            first = datetime(y, m + 1, 1)
+            last = min(datetime(y + (m + 1) // 12, (m + 1) % 12 + 1, 1) - timedelta(days=1), today)
+            tx += taifex_month(first.strftime("%Y/%m/%d"), last.strftime("%Y/%m/%d"))
+            ix.update(twse_month(first.strftime("%Y%m%d")))
+            time.sleep(3)  # 證交所限流比較嚴
+        fits = {s: fit_preopen(preopen_pairs(tx, ix, s)) for s in ("night", "open")}
+        if all(fits.values()):
+            preopen_fit.clear()
+            preopen_fit.update(fits, date=time.strftime("%Y%m%d"))
+            PREOPEN_FILE.write_text(json.dumps(preopen_fit), encoding="utf-8")
+            note_src("盤前係數", True)
+    except Exception as e:
+        note_src("盤前係數", False, type(e).__name__)  # 沿用上次的係數，PREOPEN_RETRY 後再試
+    finally:
+        preopen_busy = False
+
+
+def load_preopen():
+    try:
+        blob = json.loads(PREOPEN_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if "night" in blob:  # 舊格式只有夜盤一組，當成沒算過，重抓
+        preopen_fit.update(blob)
+
+
+load_preopen()

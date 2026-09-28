@@ -224,3 +224,52 @@ def row(sym, name, hold=False):
             "vr": vr, "vr_tone": vr_tone, "bias": dev, "bias_tone": dev_tone, "pos": pos, "pos_tone": pos_tone,
             "chip": chip, "chip_tone": chip_tone, "pat": pat, "pat_tone": pat_tone,
             "low": low, "high": high, "sector": sym in SECTOR_SET, "stale": stale(sym)}
+
+
+PREOPEN_FRESH = 11 * 3600  # 開盤後拿來對照的夜盤要是今天凌晨那段：05:00 收完，到 16:00 都算
+last_open_est = {}  # 日期 -> (預估, 台指期漲跌, 台指期價)：09:00 前最後一次用日盤算的預估，開盤後拿來對照（日盤價開盤後還會動）
+
+
+def preopen():
+    """盤前預估（網頁「盤前預估」頁用）。phase：
+      live 夜盤交易中（15:00～05:00），預估隨夜盤跳；final 夜盤收了、還沒開盤（含週末、假日）；
+      open 開盤後到 15:00，列出實際開盤跟預估對照。
+    stage：night 用夜盤；open 用 08:45 開盤的台指期日盤（回測比夜盤準約兩成），各有各的係數與成績。
+    est／actual／move 都是比例（0.01＝1%）。"""
+    now = time.localtime()
+    hm, today = now.tm_hour * 100 + now.tm_min, time.strftime("%Y%m%d")
+    trading = now.tm_wday < 5 and not mk.tw_closed()
+    phase = "open" if trading and 900 <= hm < 1500 else         "live" if mk.futures_open() and (hm >= 1500 or hm <= 500) else "final"
+    n, dq = mk.night.get("TXF"), mk.day_quote.get("TXF")
+    stage, move, px = "night", None, None
+    if n and n[1] and not (phase == "open" and time.time() - n[2] > PREOPEN_FRESH):  # 面板今天才開就沒有昨晚的夜盤
+        move, px = n[0] / n[1] - 1, n[0]
+    fits = mk.preopen_fit
+    if phase == "open" and today in last_open_est:
+        stage, (est, move, px) = "open", last_open_est[today]
+    else:
+        if trading and 845 <= hm < 900 and dq and dq[1] and dq[2] == today:
+            stage, move, px = "open", dq[0] / dq[1] - 1, dq[0]
+        beta = fits.get(stage, {}).get("beta")
+        est = beta * move if move is not None and beta else None
+        if stage == "open" and est is not None:
+            last_open_est.clear()  # 只留今天
+            last_open_est[today] = (est, move, px)
+    fit = fits.get(stage, {})
+    actual = None
+    lb, q = mk.live_bar.get("^TWII"), quotes.get("^TWII") or ()
+    if phase == "open" and lb and lb[0] == today and len(q) > 1 and q[1]:
+        actual = lb[1] / q[1] - 1
+    # 換算點數的基準＝要預估的那次開盤的「前一天收盤」：開盤前是最新收盤價，開盤後是昨收
+    base = (q[1] if phase == "open" else q[0]) if len(q) > 1 else None
+    adrs = []
+    for us, tw, ratio in mk.ADRS:
+        a, t, fx = quotes.get(us) or (), quotes.get(tw) or (), (quotes.get("TWD=X") or (None,))[0]
+        pct = a[0] / a[1] - 1 if len(a) > 1 and a[1] else None
+        prem = a[0] * fx / (t[0] * ratio) - 1 if a and t and t[0] and fx else None  # ADR 換算成台幣後比台股貴多少
+        adrs.append({"sym": us, "name": dict(mk.PREOPEN_ITEMS)[us], "pct": pct, "prem": prem})
+    return {"phase": phase, "stage": stage, "est": est, "actual": actual, "move": move, "px": px, "base": base,
+            "age": int(time.time() - n[2]) if n and stage == "night" else None,
+            "beta": fit.get("beta"), "band": fit.get("band"), "mae": fit.get("mae"), "hit": fit.get("hit"),
+            "n": fit.get("n"), "days": fit.get("days"), "fitDate": fits.get("date"),
+            "recent": fit.get("recent", []), "adrs": adrs}
