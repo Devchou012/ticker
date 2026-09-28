@@ -279,7 +279,7 @@ def vol_rows(sym, width, n):
             for x in range(i * step, min(i * step + body, width)):
                 grid[VOL_ROWS - 1 - k][x], style[VOL_ROWS - 1 - k][x] = ch, VOL_UP if c >= o else VOL_DOWN
     return ["".join(r) for r in grid], style
-FLASH_SEC = 0.25               # 閃燈半週期：一秒亮暗各兩次
+FLASH_SEC = 1.2                # 閃燈半週期：亮 1.2 秒、暗 1.2 秒。原本一秒閃兩次像警報在催人買；終端機做不到漸亮漸暗，用慢閃
 # 燈用彩色 emoji 圓點：文字的 ● 只是字形上色，看起來空心；emoji 是整顆填滿的顏色。各佔兩格
 ZONE_ON, FLOW_ON = "🟠", "🔴"
 # 熄燈：跟網頁一樣是面板色系的暗灰點（emoji ⚫ 是近乎全黑的圓，在藍灰底上像破洞）。
@@ -289,7 +289,7 @@ LAMP_OFF, LAMP_OFF_STYLE = "● ", "#2a2e39"
 
 def buy_light(sym):
     """訊號燈：左邊橘燈＝弱勢提醒（剛跌破半年線，跟 K 線圖上的半年線同色），恆亮不閃；
-    右邊紅燈＝買點（拉回流程成立），閃爍。只有買點會閃，警訊不會被看成買點。"""
+    右邊紅燈＝上漲回檔（拉回流程成立），慢閃。只有紅燈會閃，警訊不會被看成紅燈。"""
     t = Text()
     if not sym or sym in SECTOR_SET:
         return t

@@ -149,7 +149,7 @@ def demo():
     assert lamps() == [(m.LAMP_OFF, m.LAMP_OFF_STYLE)], "熄的紅燈是暗灰點"
     assert m.cell_len(m.LAMP_OFF) == m.cell_len(m.ZONE_ON) == 2, "亮暗寬度一樣，整欄不會跳"
     sg.buy_signal, m.time.time = real_signal, real_time
-    assert m.FLASH_SEC <= 0.25, "閃燈要比原本的 0.5 秒快"
+    assert m.FLASH_SEC >= 1, "紅燈慢閃：一秒閃兩次像警報在催人買"
 
     # 點大盤：從畫面反查點到哪一個，選了之後換頁不會被換掉，上下鍵回到個股
     m.screen[:] = ["   加權 21,000     S&P 6,500     台指期 21,050   ", "   +1.0%   ", "觀察  ETF"]
@@ -231,7 +231,7 @@ def demo():
     # 閃燈原因：燈亮才有，寫出成立的是哪幾項
     setup()
     why = m.buy_reason("BUY")
-    assert why and why[0] == "買點" and "半年線上揚" in why[1] and "回測月線" in why[1] and "量縮" in why[1]         and "長下影" in why[1], why
+    assert why and why[0] == "上漲回檔" and "半年線上揚" in why[1] and "回測月線" in why[1] and "量縮" in why[1]         and "長下影" in why[1], why
     setup(quiet=False)
     assert "量縮" not in (m.buy_reason("BUY") or ("", "", ""))[1], "紅燈沒亮不寫流程原因"
     m.bars["FLAT"] = [[100.0] * 4 for _ in range(130)]
