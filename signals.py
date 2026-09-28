@@ -136,7 +136,8 @@ def buy_reason(sym):
     weak = f"跌破半年線 {abs(d['gap']):.1%}，回測顯示之後常落後大盤" if zone else ""
     if flow_ok:
         note = f"半年線上揚・季線上揚・回測{d['held']}・量縮・{d['trigger']}"
-        return "買點", note + (f"｜{weak}" if weak else ""), "up"
+        # 叫「上漲回檔」不叫買點：扣掉趨勢後超額約為 0（ticker-web/research），描述發生了什麼，不叫人買
+        return "上漲回檔", note + (f"｜{weak}" if weak else ""), "up"
     return ("弱勢", weak, "zone") if zone else None
 
 
