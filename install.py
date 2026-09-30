@@ -4,6 +4,7 @@
     python %USERPROFILE%\\ticker\\install.py
 """
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -29,23 +30,39 @@ if not portfolio.exists():
     shutil.copy(HERE / "portfolio.example.json", portfolio)
     step("portfolio.json created from the example (edit holdings by hand)")
 
-# 3. Claude Code SessionStart hook that opens the panel above Claude Code
+# 3. Windows Terminal Alt+Q toggles the panel above the current pane (nothing opens on its own)
 settings = HOME / ".claude" / "settings.json"
-cfg = json.loads(settings.read_text(encoding="utf-8")) if settings.exists() else {}
-autostart = (HERE / "autostart.ps1").as_posix()
-hooks = cfg.setdefault("hooks", {}).setdefault("SessionStart", [])
-if any("autostart.ps1" in h.get("command", "") for entry in hooks for h in entry.get("hooks", [])):
-    step("SessionStart hook already present")
-else:
-    if settings.exists():
+if settings.exists():  # older installs opened the panel from a SessionStart hook: remove it
+    cfg = json.loads(settings.read_text(encoding="utf-8"))
+    hooks = cfg.get("hooks", {}).get("SessionStart", [])
+    kept = [e for e in hooks if not any("autostart.ps1" in h.get("command", "") for h in e.get("hooks", []))]
+    if len(kept) != len(hooks):
         shutil.copy(settings, settings.with_name("settings.json.bak-ticker"))
-    hooks.append({"matcher": "startup", "hooks": [{
-        "type": "command",
-        "command": f"powershell -NoProfile -ExecutionPolicy Bypass -File {autostart} 2>/dev/null || true",
-        "timeout": 15}]})
-    settings.parent.mkdir(parents=True, exist_ok=True)
-    settings.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    step(f"SessionStart hook added (backup: {settings.name}.bak-ticker)")
+        if kept:
+            cfg["hooks"]["SessionStart"] = kept
+        else:
+            del cfg["hooks"]["SessionStart"]
+            if not cfg["hooks"]:
+                del cfg["hooks"]
+        settings.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        step(f"old SessionStart hook removed (backup: {settings.name}.bak-ticker)")
+
+wt = Path(os.environ["LOCALAPPDATA"]) / "Packages/Microsoft.WindowsTerminal_8wekyb3d8bbwe/LocalState/settings.json"
+if wt.exists():
+    cfg = json.loads(wt.read_text(encoding="utf-8"))
+    toggle = (HERE / "toggle.ps1").as_posix()
+    action = {"command": {"action": "splitPane", "split": "up", "size": 0.45,
+                          "commandline": f"powershell -NoProfile -ExecutionPolicy Bypass -File {toggle}"},
+              "id": "User.tickerToggle"}
+    cfg["actions"] = [a for a in cfg.get("actions", []) if a.get("id") != "User.tickerToggle"] + [action]
+    binds = cfg.setdefault("keybindings", [])
+    if not any(k.get("id") == "User.tickerToggle" for k in binds):
+        binds.append({"id": "User.tickerToggle", "keys": "alt+q"})
+    shutil.copy(wt, wt.with_name("settings.json.bak-ticker"))
+    wt.write_text(json.dumps(cfg, indent=4, ensure_ascii=False) + "\n", encoding="utf-8")
+    step("Windows Terminal Alt+Q toggles the panel")
+else:
+    step("Windows Terminal not found: skipped Alt+Q")
 
 # 4. PowerShell command `cs` (alias 股票介面) that opens a new window: panel on top, Claude Code below
 # powershell writes the path in the console codepage, not UTF-8 (CJK home dirs break text=True)
@@ -69,4 +86,4 @@ ps = ('$s=(New-Object -ComObject WScript.Shell).CreateShortcut('
 subprocess.check_call(["powershell", "-NoProfile", "-Command", ps])
 step("desktop shortcut 行情面板 created")
 
-print("Done. Restart Claude Code inside Windows Terminal, or run `cs`.")
+print("Done. Press Alt+Q in Windows Terminal to open or close the panel, or run `cs`.")

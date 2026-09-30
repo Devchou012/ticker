@@ -84,6 +84,7 @@
 | 數字鍵、點頁籤 | 跳到第幾個頁籤；再點同一頁籤翻它的下一子頁 |
 | `+` `-` | K 線縮放（三段） |
 | 空白鍵 | 暫停／恢復自動翻頁（標題出現 ⏸） |
+| `Alt+Q`（任一窗格） | 開／關面板 |
 | `q` | 離開 |
 
 底部快捷鍵列隨時列出這些按鍵。
@@ -98,7 +99,7 @@ python %USERPROFILE%\ticker\install.py
 `install.py` 可以重複跑，已完成的步驟會跳過：
 1. 安裝 `rich`、`yfinance`。
 2. 從 `portfolio.example.json` 建立 `portfolio.json`（不進 git，各台機器自己一份）。
-3. 加 Claude Code SessionStart hook：在 Windows Terminal 開 Claude Code 時自動在上方分割出面板。
+3. 在 Windows Terminal 加 `Alt+Q`：在目前窗格上方分割出面板，再按一次關掉。面板不會自己跳出來（舊版的 SessionStart hook 會被移除）。
 4. 在 PowerShell profile 加 `cs`（別名 `股票介面`）指令。
 5. 桌面建立「行情面板」捷徑。
 
@@ -157,7 +158,7 @@ python watch.py                     # 列出
 | `signals.py` | 判斷層 |
 | `watch.py` | 觀察清單增刪 |
 | `install.py` | 新機器安裝 |
-| `stocks.cmd` / `autostart.ps1` | 開新視窗／從 Claude Code 自動分割窗格 |
+| `stocks.cmd` / `toggle.ps1` | 開新視窗／`Alt+Q` 開關面板 |
 | `set_fugle_key.ps1` | 存富果 API key |
 | `portfolio.json` | 個人清單（不進 git） |
 | `daily.json` / `chips.json` / `flow.json` | 日線、外資籌碼、內外盤累計快取（不進 git，自動產生） |

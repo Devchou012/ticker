@@ -827,6 +827,8 @@ def main():
             lock.bind(("127.0.0.1", 47653))
         except OSError:
             return  # 已經有面板在跑：exit 0，wt 會自動關掉這個窗格
+        lock.listen(1)  # toggle.ps1 連進來 = 請面板關掉（Alt+Q）
+        lock.setblocking(False)
     load_daily()
     load_chips()
     load_flow()
@@ -870,6 +872,11 @@ def main():
             idx %= len(names)
             key, pending = pending or read_key(), None
             new = idx
+            try:
+                lock.accept()
+                key = "q"  # toggle.ps1 敲門：跟按 q 一樣正常結束，外層不重跑、窗格自己關
+            except BlockingIOError:
+                pass
             if key == "q":
                 return
             if key == " ":  # 空白鍵定住這一頁，標題出現 ⏸；再按一次恢復自動翻頁
