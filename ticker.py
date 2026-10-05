@@ -808,6 +808,62 @@ def start_web():
         traceback.print_exc()  # 網頁版壞了不影響面板；錯誤寫進 ticker-errors.log
 
 
+# ── 背景服務：不畫畫面，只抓資料、開網頁（--headless）──────────────────────────
+# 平常開機就在背景跑，網頁一直有資料；要看終端機畫面時開畫面，會先請背景收工、接手，按 q 離開後再交回背景。
+# 收工用檔案通知而不是砍程序：外層重跑迴圈看到子程序被砍會再開一個
+STOP_FILE = Path(__file__).with_name("ticker.stop")
+LOCK_PORT = 47653  # 單一實例鎖：面板（背景或畫面）在跑就佔著這個本機 port
+
+
+def panel_running():
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", LOCK_PORT))
+        return False
+    except OSError:
+        return True
+    finally:
+        s.close()
+
+
+def headless():
+    """背景模式的主迴圈：名單檔改了照樣重讀；程式碼改了 exit 3 讓外層用新版重開；看到停止檔就收工。"""
+    mtime, code_at = reload_if_changed(None), code_mtime()
+    while not STOP_FILE.exists():
+        mtime = reload_if_changed(mtime)
+        if code_mtime() != code_at:
+            sys.exit(3)
+        time.sleep(1)
+    STOP_FILE.unlink(missing_ok=True)
+
+
+def bg(cmd):
+    """背景服務開關：start／stop／status。回傳 (成功與否, 給人看的一句話)。"""
+    import subprocess
+    if cmd == "status":
+        return True, "正在跑（背景服務或終端機畫面）：網頁 http://127.0.0.1:47654" if panel_running() else "沒有在跑"
+    if cmd == "start":
+        if panel_running():
+            return True, "已經在跑，不用再開"
+        STOP_FILE.unlink(missing_ok=True)  # 上次沒收乾淨的停止檔會讓新開的馬上收工
+        # 隱藏的主控台：沒有視窗，也不跟著開它的終端機一起關
+        subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--headless"],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         creationflags=subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP)
+        return True, "已在背景啟動：網頁 http://127.0.0.1:47654"
+    if cmd == "stop":
+        if not panel_running():
+            return True, "本來就沒在跑"
+        STOP_FILE.touch()
+        for _ in range(30):
+            if not panel_running():
+                return True, "已停止"
+            time.sleep(0.5)
+        STOP_FILE.unlink(missing_ok=True)
+        return False, "15 秒內沒停：在跑的是終端機畫面（在那個窗格按 q 離開），不是背景服務"
+    return False, "用法：python ticker.py --bg start|stop|status"
+
+
 def code_mtime():
     """面板與網頁版程式最後修改的時間：任一個改了，面板就在原窗格用新版重開。"""
     here = Path(__file__)
@@ -824,7 +880,7 @@ def main():
         log_stderr()
         lock = socket.socket()
         try:  # 佔一個本機 port 當單一實例鎖，程式結束（含被砍）自動釋放
-            lock.bind(("127.0.0.1", 47653))
+            lock.bind(("127.0.0.1", LOCK_PORT))
         except OSError:
             return  # 已經有面板在跑：exit 0，wt 會自動關掉這個窗格
     load_daily()
@@ -840,6 +896,9 @@ def main():
     threading.Thread(target=fugle_worker, daemon=True).start()
     if "--once" not in sys.argv:
         start_web()  # 網頁版：http://127.0.0.1:47654
+    if "--headless" in sys.argv:
+        headless()
+        return
     idx = 0
     if "--once" in sys.argv:  # 自我檢查：抓一輪、印出所有頁
         while not mk.last_update:
@@ -924,8 +983,17 @@ if __name__ == "__main__":
     if "--child" in sys.argv or "--once" in sys.argv:
         main()
     else:
+        if "--bg" in sys.argv:  # 背景服務開關，給 PowerShell 指令與開機啟動用
+            ok, msg = bg((sys.argv[sys.argv.index("--bg") + 1:] or [""])[0])
+            print(msg)
+            sys.exit(0 if ok else 1)
+        screen = "--headless" not in sys.argv
+        if screen and panel_running():
+            print(bg("stop")[1])  # 要看畫面：先請背景服務收工、接手；接不了（是另一個畫面）就讓子程序照舊自己結束
         # 外層只管重跑：程式碼改了（exit 3）或子程序被砍都在原窗格重開，不會留下死掉的窗格；q 正常結束才收
         import subprocess
         while subprocess.call([sys.executable, __file__, "--child", *sys.argv[1:]]) != 0:
             time.sleep(0.5)
+        if screen:
+            bg("start")  # 按 q 離開畫面：交回背景服務，網頁繼續有資料。直接關掉窗格不會走到這裡，下次開 Claude Code 由 hook 補開
 

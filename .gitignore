@@ -6,3 +6,4 @@ chips.json
 flow.json
 backtest_cache.json
 preopen.json
+ticker.stop
