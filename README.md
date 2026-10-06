@@ -92,8 +92,8 @@
 ## 安裝
 
 ```
-git clone https://github.com/Devchou012/ticker.git %USERPROFILE%\ticker
-python %USERPROFILE%\ticker\install.py
+git clone https://github.com/Devchou012/ticker.git $env:USERPROFILE\ticker
+python $env:USERPROFILE\ticker\install.py
 ```
 
 `install.py` 可以重複跑，已完成的步驟會跳過：
