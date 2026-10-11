@@ -4,6 +4,7 @@ import json
 import os
 import re
 import ssl
+import sys
 import threading
 import time
 import urllib.parse
@@ -180,6 +181,19 @@ SECTOR_SET = {f"{c}.TW" for c in SECTOR_CODES}  # 這些只走 MIS，不進 yfin
 ALERT_SEC = 300       # 訊息在跑馬燈上留多久
 VOL_ALERT = 3.0       # 量比超過這個倍數就自動報一次
 
+warn_at = {}  # (抓取種類, 例外類型) -> 上次寫進 log 的時間
+
+
+def warn(what, e, detail=""):
+    """背景抓取失敗：照樣沿用舊值，但留一行在 stderr（ticker 把 stderr 導進 ticker-errors.log）。
+    同一種抓取、同一種例外 10 分鐘只記一次：fetch 每輪每檔都跑，斷線時不節流會洗出幾百行。"""
+    key = (what, type(e).__name__)
+    if time.time() - warn_at.get(key, 0) < 600:
+        return
+    warn_at[key] = time.time()
+    print(f"{datetime.now():%m-%d %H:%M:%S} {what}{detail} 失敗：{type(e).__name__}: {e}", file=sys.stderr, flush=True)
+
+
 quote_at = {}  # symbol -> 最後一次寫進報價的時間，判斷過期用
 
 
@@ -280,8 +294,8 @@ def load_holidays():
         if days:
             tw_holidays.clear()
             tw_holidays.update(days)
-    except Exception:
-        pass  # 抓不到就沿用上次的；第一次就失敗則當成沒有假日（跟以前一樣）
+    except Exception as e:
+        warn("假日表", e)  # 抓不到就沿用上次的；第一次就失敗則當成沒有假日（跟以前一樣）
     holiday_at = time.time()
 
 
@@ -495,8 +509,8 @@ def fetch(sym):
         fi = yf.Ticker(sym).fast_info
         quotes[sym] = (fi["lastPrice"], fi["previousClose"], fi["lastVolume"], fi["tenDayAverageVolume"],
                        fi["dayLow"], fi["dayHigh"])
-    except Exception:
-        pass  # 保留舊值，下輪再試
+    except Exception as e:
+        warn("yfinance 報價", e, f" {sym}")  # 保留舊值，下輪再試
 
 
 # 各市場現貨交易時段（台灣時間，開盤分鐘數, 時長分鐘數）；總經、期貨沒有量比。美股開盤時間看夏令時間（window()）
@@ -726,8 +740,8 @@ def daily_worker(syms=None):
     daily_busy = True
     try:
         fetch_daily(syms)
-    except Exception:
-        pass  # 抓不到就沿用上次存的
+    except Exception as e:
+        warn("日線", e)  # 抓不到就沿用上次存的
     finally:
         daily_busy = False
 
