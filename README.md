@@ -89,6 +89,20 @@
 
 底部快捷鍵列隨時列出這些按鍵。
 
+## 背景服務
+
+網頁版的資料來自面板程序，所以面板平常可以不畫畫面、只在背景抓資料與開網頁：
+
+```
+python ticker.py --bg start    # 在背景啟動（沒有視窗，不跟著終端機關閉）
+python ticker.py --bg stop     # 停止（用 ticker.stop 檔通知它自己收工）
+python ticker.py --bg status
+```
+
+- 要看終端機畫面就照常開（`cs`／`股票介面`、桌面捷徑）：畫面會先請背景服務收工再接手，按 `q` 離開後自動交回背景，網頁只斷幾秒。直接關掉窗格不會交回，下次開 Claude Code 由 hook 補開。
+- 背景模式照樣監看程式碼與 `portfolio.json`，改了會自動用新版重開／重讀。
+- 可以在 PowerShell profile 加一個短指令：`function 點燈 { param([ValidateSet('start','stop','status')][string]$cmd = 'status') python "$HOME\ticker\ticker.py" --bg $cmd }`。
+
 ## 安裝
 
 ```
@@ -99,7 +113,7 @@ python $env:USERPROFILE\ticker\install.py
 `install.py` 可以重複跑，已完成的步驟會跳過：
 1. 安裝 `rich`、`yfinance`。
 2. 從 `portfolio.example.json` 建立 `portfolio.json`（不進 git，各台機器自己一份）。
-3. 在 Windows Terminal 加 `Alt+Q`：在目前窗格上方分割出面板，再按一次關掉。面板不會自己跳出來（舊版的 SessionStart hook 會被移除）。
+3. 在 Windows Terminal 加 `Alt+Q`：按一下在目前窗格上方開終端機畫面（接手背景服務），再按一次關掉畫面、交回背景服務。
 4. 在 PowerShell profile 加 `cs`（別名 `股票介面`）指令。
 5. 桌面建立「行情面板」捷徑。
 
@@ -158,7 +172,7 @@ python watch.py                     # 列出
 | `signals.py` | 判斷層 |
 | `watch.py` | 觀察清單增刪 |
 | `install.py` | 新機器安裝 |
-| `stocks.cmd` / `toggle.ps1` | 開新視窗／`Alt+Q` 開關面板 |
+| `stocks.cmd` / `toggle.ps1` | 開新視窗／`Alt+Q` 開關面板畫面 |
 | `set_fugle_key.ps1` | 存富果 API key |
 | `portfolio.json` | 個人清單（不進 git） |
 | `daily.json` / `chips.json` / `flow.json` | 日線、外資籌碼、內外盤累計快取（不進 git，自動產生） |
@@ -205,6 +219,7 @@ python watch.py                     # 列出
 ## 變更紀錄
 
 **2026-09-28**
+- 背景服務：`--bg start|stop|status`、`--headless`。開終端機畫面時接手背景、按 q 交回；登入 Windows 時由啟動資料夾捷徑自動開背景服務。
 - 紅燈不再叫「買點」：回測扣掉趨勢後超額約為 0，K 線下方標籤改「上漲回檔」；紅燈從一秒閃兩次改成亮暗各 1.2 秒的慢閃，不再像警報在催人買。網頁版一起改。
 - 盤前預估多回傳換算點數用的昨收（`base`：開盤前是最新收盤，開盤後是昨收），網頁據此顯示預估開盤指數與漲跌點數。
 - 盤前預估分兩段：08:45 台指期日盤開盤後改用日盤價（另一組滾動係數）；09:00 前最後一次的預估留下來，開盤後拿來對照。回測 2023 年後平均誤差 0.27%→0.22%、方向 89%→94%。日經、KOSPI 開盤跳空試過沒有幫助，不放（ticker-web `research/preopen_asia.py`）。

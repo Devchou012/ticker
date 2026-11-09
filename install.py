@@ -86,4 +86,12 @@ ps = ('$s=(New-Object -ComObject WScript.Shell).CreateShortcut('
 subprocess.check_call(["powershell", "-NoProfile", "-Command", ps])
 step("desktop shortcut 行情面板 created")
 
+# 6. Background service at logon: data and the web page stay up with no panel open
+ps = ('$s=(New-Object -ComObject WScript.Shell).CreateShortcut('
+      '[Environment]::GetFolderPath("Startup")+"\行情背景服務.lnk");'
+      f'$s.TargetPath="{Path(sys.executable).with_name("pythonw.exe")}";'
+      f'$s.Arguments="""{HERE / "ticker.py"}"" --bg start";$s.WorkingDirectory="{HERE}";$s.Save()')
+subprocess.check_call(["powershell", "-NoProfile", "-Command", ps])
+step("background service starts at logon")
+
 print("Done. Press Alt+Q in Windows Terminal to open or close the panel, or run `cs`.")
