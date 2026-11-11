@@ -113,6 +113,8 @@ BASE_PAGES = {
              ("TWD=X", "美元/台幣"), ("JPY=X", "美元/日圓"), ("KRW=X", "美元/韓元"),
              # 國際股市：亞洲、中港、歐洲三個時區接力，跟大盤列的美台股湊成一輪
              ("^N225", "日經"), ("^HSI", "恒生"), ("^GDAXI", "德DAX"),
+             # 美股指數期貨（CME 近月）：幾乎 24 小時交易，台灣白天看美股方向就靠這組；季底換月那天漲跌幅會失真
+             ("YM=F", "道瓊期"), ("NQ=F", "那斯達克期"), ("SOX=F", "費半期"), ("ES=F", "S&P期"),
              # 貴金屬
              # PAXG 是代幣化黃金，24/7 不休市；期貨週末、美國假日停牌時看它，價差約 1.5%（持有成本＋幣圈溢價）
              ("GC=F", "黃金"), ("PAXG-USD", "黃金24h"), ("SI=F", "白銀"), ("XAGX-USD", "白銀24h"),
@@ -403,7 +405,8 @@ CNBC_SYM = {"^N225": ".N225", "^HSI": ".HSI", "^GDAXI": ".GDAXI", "^VIX": ".VIX"
             "^GSPC": ".SPX", "^IXIC": ".IXIC", "^DJI": ".DJI", "^SOX": ".SOX",
             "EURUSD=X": "EUR=", "CNY=X": "CNY=", "TWD=X": "TWD=", "JPY=X": "JPY=", "KRW=X": "KRW=",
             "GC=F": "@GC.1", "SI=F": "@SI.1", "HG=F": "@HG.1", "CL=F": "@CL.1", "BZ=F": "@LCO.1",
-            "NG=F": "@NG.1", "BTC-USD": "BTC.CM="}
+            "NG=F": "@NG.1", "BTC-USD": "BTC.CM=",
+            "YM=F": "@DJ.1", "NQ=F": "@ND.1", "ES=F": "@SP.1"}  # SOX=F CNBC 查無，限流時就等 Yahoo
 
 
 def cnbc_sym(sym):
